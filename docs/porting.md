@@ -246,26 +246,66 @@ everything post-ath9k, this family is blocked at both gate 1 and gate 2.
 
 ### ESP32 — the real parallel, and a useful reality check
 
-As of October 2026 the ESPARGOS team's **ESP-SDR** shows several ESP32 parts
-(ESP32, C3, C5, C6, C61, S2, S3, and preview S31) can bypass the Wi-Fi/BT modem
-and capture raw baseband IQ into internal SRAM, tuning ~2.2–2.7 GHz and, on the
-C5, 4.8–6.0 GHz, at up to 80 MS/s with roughly 13–54 MHz of usable bandwidth.
-The register sequence was recovered by reverse-engineering `adctrig` in
-Espressif's `librftest` — i.e. **the same pattern as this project: a factory-test
-capture path, undocumented, found by decoding the vendor's own test code.**
+The ESPARGOS team's **ESP-SDR** (`ESPARGOS/esp-sdr`, GPL-3.0-or-later) shows a
+whole line of ESP32 parts — ESP32, C2, C3, C5, C6, C61, H2, S2, S3, and the
+experimental S31 — bypassing the fixed-function Wi-Fi/BT modem through an
+undocumented debug path and capturing raw baseband IQ from the built-in
+receiver. The README is candid that the path was found with LLM assistance and
+that parts of the firmware are AI-generated: **the same pattern as this project —
+an undocumented factory/debug capture path, decoded with machine help — which is
+the best public confirmation the method generalizes across vendors.**
 
-It is the best available confirmation that the method generalizes. It is also a
-precise illustration of gate 3: over USB/UART only snapshots reach the host, so
-the device is a spectrum analyzer rather than a receiver. Only the Ethernet-
-equipped S31 streams continuously, at 16 MS/s — 5 % of the W1700K's rate. Same
-technique, two orders of magnitude apart in capability, and the difference is
-entirely the egress pipe.
+It is also the cleanest possible illustration of gate 3. One capture technique
+runs across the entire line; capability is set almost entirely by the egress
+pipe and the sample width:
 
-For this repository, an ESP32 source is nonetheless the **cheapest possible
-end-to-end portability test**: ~$8, no firmware authentication to defeat, and a
-known-good capture path. If an ESP32-S31 can be made to emit Contract A, that
-proves the host stack is source-agnostic for about a weekend's work, and it would
-be a genuinely useful instrument at 16 MS/s.
+| Part | Capture ceiling | Off-chip reality | Result |
+| --- | --- | --- | --- |
+| Most (ESP32, C2/C3/C6/C61, S2) | 80 MS/s internal | ASCII `CAP16`/`CAP20` snapshots over USB/UART | spectrum analyzer |
+| S3 | 80 MS/s internal | continuous, but decimated on the second core to ≤250 kSa/s | narrowband monitor |
+| S31 (experimental) | 80 MS/s internal | 20 MSa/s USB / **40 MSa/s Ethernet**, 8-bit I/Q | a real, if modest, receiver |
+| — W1700K, for scale — | 320 MS/s | **1.28 GB/s** over 10 GbE, 14-bit | the thing being matched |
+
+Best-case ESP (S31 Ethernet) is 40 MSa/s × 8 bits = **80 MB/s**; the W1700K is
+1.28 GB/s at 14 bits. One capture idea, ~16× the throughput and nearly double the
+depth between them, and the entire gap is the pipe. Tuning on the ESP line is a
+software attempt range of 100–6000 MHz (no guaranteed lock), with 5 GHz verified
+on the C5 and an experimental divider mode reaching ~1.84 GHz on several parts;
+gain and power are uncalibrated.
+
+Two facts bear directly on the rest of this document:
+
+- **Capture is RX-only, by firmware choice, not silicon.** The README notes a TX
+  path exists in the hardware but "this firmware currently implements reception
+  only." So ESP32 TX is in the same state as everyone else's (§ TX below): the
+  path is there, nobody has driven it.
+- **The core split is the REA-lane split.** The RISC-V parts (C2/C3/C5/C6/C61,
+  H2) go straight into REA's RISC-V ELF lane, and because they are ordinary
+  ESP-IDF ELF builds they need no container unwrap — unlike the MediaTek
+  firmware, which does. The Xtensa parts (original ESP32, S2, S3) have **no REA
+  lane at all**, which is awkward because the S3 is the best continuous-streaming
+  part and the one a decompiler can't touch.
+
+#### What ESP-SDR changes for this repository
+
+It is still the **cheapest end-to-end portability test** — ~$8, no firmware
+authentication to defeat, a known-good capture path — but two integration
+directions are now visible, and the second is probably the better investment:
+
+1. **ESP → Contract A (a shim).** ESP-SDR's continuous IQS frames already carry
+   sample indices, gap flags and a CRC32 — structurally the same information as
+   Contract A's `seq`, event/lost tags and integrity checks. A small adapter that
+   repackages IQS frames as `SDR1` datagrams would let `w1700k-stream` ingest an
+   ESP source unchanged, proving the host stack is source-agnostic in about a
+   weekend.
+2. **W1700K → SoapySDR (the ecosystem seam).** ESP-SDR ships a `SoapyESPSDR`
+   driver, i.e. the host side is already solved through SoapySDR, the lingua
+   franca that GQRX, SDR++ and GNU Radio all consume. A reciprocal `SoapyW1700K`
+   module over Contract B would plug *this* project into that whole ecosystem and
+   reframe the portability story from "port other radios into our wire format" to
+   "our receiver is one SoapySDR source among many." Higher leverage than the
+   inbound shim, and it makes every future source (ESP, Broadcom, a MediaTek
+   client part) interoperable for free.
 
 ### Nordic — the honest no
 
@@ -283,8 +323,11 @@ Same reasoning disposes of TI's CC13xx/CC26xx.
    couplings above into a source descriptor; add a synthetic test source that
    emits Contract A from a file. This makes everything below falsifiable and is
    worth doing regardless of which radio wins.
-2. **ESP32-S31 → Contract A** (a weekend, ~$8). Proves the host stack is
-   source-agnostic end to end and yields a working 16 MS/s receiver.
+2. **ESP32-S31 → the host stack** (a weekend, ~$8). Proves the host stack is
+   source-agnostic end to end and yields a working receiver (up to 40 MSa/s over
+   the S31's Ethernet, 8-bit). Do it via SoapySDR rather than the Contract A
+   shim if the `SoapyW1700K` module from § ESP-SDR gets built — the ecosystem
+   seam is worth more than a one-off adapter.
 3. **MT7921/7922 register reconnaissance** (days, ~$20). Probe for an ICAP block
    and a route; check ROM download authentication. This is the one branch that
    could reach W1700K-class performance with *less* system complexity than the
