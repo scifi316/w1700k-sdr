@@ -64,16 +64,20 @@ def compress(image):
 
     Stock U-Boot decompresses this; a streaming compressor would leave the
     'unknown size' marker in the header, which stock is not relied on to handle.
+    The stream still ends with an end marker. liblzma 5.2.5 (Ubuntu 22.04) rejects
+    a known size followed by an end marker, where 5.2.12 and later accept it, so
+    the stream is checked while its header still says the size is unknown.
     """
     compressor = lzma.LZMACompressor(
         format=lzma.FORMAT_ALONE,
         filters=[{'id': lzma.FILTER_LZMA1, 'preset': 9 | lzma.PRESET_EXTREME,
                   'dict_size': LZMA_DICTIONARY}])
-    payload = bytearray(compressor.compress(image) + compressor.flush())
-    require(payload[5:13] == b'\xff' * 8, 'loader: unexpected LZMA header')
-    struct.pack_into('<Q', payload, 5, len(image))
-    require(lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(bytes(payload)) == image,
+    stream = compressor.compress(image) + compressor.flush()
+    require(stream[5:13] == b'\xff' * 8, 'loader: unexpected LZMA header')
+    require(lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(stream) == image,
             'loader: the LZMA payload does not decompress to u-boot.bin')
+    payload = bytearray(stream)
+    struct.pack_into('<Q', payload, 5, len(image))
     return bytes(payload)
 
 
