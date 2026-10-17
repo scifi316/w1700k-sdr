@@ -12,10 +12,10 @@
 PYTHON ?= python3
 export PYTHONDONTWRITEBYTECODE := 1
 
-.PHONY: all toolchain linux sdr rootfs loader dumper images firmware host check \
+.PHONY: all toolchain linux sdr rootfs loader dumper restorer images firmware host check \
 	clean distclean
 
-all: images dumper firmware host
+all: images dumper restorer firmware host
 
 # Buildroot cross toolchain, target packages and the host tools the later steps use.
 toolchain:
@@ -37,13 +37,17 @@ rootfs: sdr
 loader: toolchain
 	$(PYTHON) platform/loader/build.py
 
-# The system and recovery FITs, the root and the durable image.
+# The system and recovery FITs, the root and the durable images (one per NAND part).
 images: rootfs loader
 	$(PYTHON) platform/images.py
 
 # The write-free NAND dumper used for the backup before installation.
 dumper: toolchain
 	$(PYTHON) platform/dumper/build.py
+
+# The restorer, which writes a backup back to return a unit to stock firmware.
+restorer: toolchain
+	$(PYTHON) platform/restorer/build.py
 
 # MT7996 ROM patch, WM/WA firmware and the stream programs.
 firmware:
@@ -62,8 +66,9 @@ check:
 # Remove build outputs but keep downloads and prepared sources.
 clean:
 	rm -rf platform/build/buildroot platform/build/linux platform/build/loader \
-		platform/build/dumper platform/build/mkimage platform/build/bootstrap \
-		platform/build/images platform/build/rootfs-overlay platform/build/logs \
+		platform/build/dumper platform/build/restorer platform/build/mkimage \
+		platform/build/bootstrap platform/build/images platform/build/rootfs-overlay \
+		platform/build/logs \
 		kernel/w1700k_sdr/build
 
 # Remove everything the build created, downloads included.

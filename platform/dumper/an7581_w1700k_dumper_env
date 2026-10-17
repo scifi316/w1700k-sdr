@@ -1,9 +1,9 @@
 loadaddr=0x90000000
-dumpsize=0x22000000
+dumpsize=0x1be00000
 serverip=192.168.1.10
 ipaddr=192.168.1.1
-dumpfile=unit-nand-raw.bin
-read_all=mtd read.raw.oob.dontskipbad spi-nand0 ${loadaddr}
+dumpfile=unit-nand.bin
+read_all=mtd read.dontskipbad spi-nand0 ${loadaddr} 0 ${dumpsize}
 hash_all=hash sha256 ${loadaddr} ${dumpsize}
 send_all=tftpput ${loadaddr} ${dumpsize} ${dumpfile}
 dump=run read_all && run hash_all && run send_all

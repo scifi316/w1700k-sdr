@@ -7,8 +7,10 @@ Two stages, in the vendor's order:
 
 The BBT lists factory-bad physical blocks below the reserve pool; logical blocks
 skip them. The BMT maps worn blocks into the reserve pool. The pool is the last
-250 blocks of a 4096-block part (the vendor clamps it to the table capacity), and
-the BMT checksum covers the whole 250-entry area.
+250 blocks of a 4096-block part (the vendor clamps it to the table capacity); on
+a 2048-block part it is what the vendor's downward scan of the factory markers
+returns (163 plus the factory-bad blocks it steps over). The BMT checksum covers
+the pool's entries.
 
 The fixture builders make synthetic tables only; they are not vendor data.
 """
@@ -50,6 +52,26 @@ def clamped_pool(total_blocks=TOTAL_BLOCKS):
 def system_blocks_for(total_blocks=TOTAL_BLOCKS):
     pool = clamped_pool(total_blocks)
     return None if pool is None else total_blocks - pool
+
+
+def vendor_pool(total_blocks, factory_bad):
+    """Stock's pool for a part whose factory-bad blocks are `factory_bad`: count
+    unmarked blocks downward from the last until total*8/100, the pool is total
+    minus where that ends; above total/8 there is no BMT (None); above 250 it is
+    250. Where the clamp already fixes it, nothing is scanned."""
+    if clamped_pool(total_blocks):
+        return MAX_ENTRIES
+    need, good, block = pool_floor(total_blocks), 0, total_blocks - 1
+    while block:
+        if block not in factory_bad:
+            good += 1
+            if good == need:
+                break
+        block -= 1
+    pool = total_blocks - block
+    if pool > pool_ceiling(total_blocks):
+        return None
+    return min(pool, MAX_ENTRIES)
 
 
 def bbt_checksum(blob):

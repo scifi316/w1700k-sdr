@@ -28,7 +28,7 @@ def fake_backup(path, image=IMAGE):
 class ExtractTest(unittest.TestCase):
     def test_extracts_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / 'nand-raw.bin'
+            source = Path(tmp) / backup.BACKUP_NAME
             fake_backup(source)
             out = backup.extract_eeprom(source, tmp)
             self.assertEqual(out.read_bytes(), IMAGE)
@@ -37,7 +37,7 @@ class ExtractTest(unittest.TestCase):
 
     def test_refuses_a_backup_without_calibration(self):
         with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / 'nand-raw.bin'
+            source = Path(tmp) / backup.BACKUP_NAME
             fake_backup(source, b'\xff' * 0x4000)
             with self.assertRaises(StepFailed):
                 backup.extract_eeprom(source, tmp)

@@ -4,7 +4,6 @@ loadaddr=0x81800000
 bootfile=w1700k-system.itb
 fitfile=w1700k-system.itb
 rootfsfile=rootfs.squashfs
-durablefile=durable.ubifs
 bootargs=console=ttyS0,115200 earlycon panic=5 ro rdinit=/init ubi.mtd=system ubi.block=0,rootfs
 verify=yes
 autostart=no
@@ -17,7 +16,6 @@ altbootcmd=echo *** boot limit exceeded, stopping at prompt ***
 boot_tftp=tftpboot ${loadaddr} ${bootfile} && iminfo ${loadaddr} && bootm ${loadaddr}#${bootconf}
 update_fit=tftpboot ${loadaddr} ${fitfile} && ubi part.rw ${bootpart} && ubi write ${loadaddr} fit ${filesize}
 update_rootfs=tftpboot ${loadaddr} ${rootfsfile} && ubi part.rw ${bootpart} && ubi write ${loadaddr} rootfs ${filesize}
-update_durable=tftpboot ${loadaddr} ${durablefile} && ubi part.rw durable && ubi write ${loadaddr} durable ${filesize}
 bootm_low=0x80000000
 bootm_size=0x80000000
 bootm_mapsize=0x80000000

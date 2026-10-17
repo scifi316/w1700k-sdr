@@ -4,9 +4,11 @@
 
 #include "airoha_bmt_write.h"
 
-#define AIROHA_IMAGE_STRIDE (AIROHA_WRITE_PAGE + AIROHA_WRITE_OOB)
-#define AIROHA_IMAGE_BYTES (64u * AIROHA_IMAGE_STRIDE)
-#define AIROHA_TRANSACTION_WORK_BYTES (2u * AIROHA_IMAGE_BYTES)
+/* One block's logical image: each page's main bytes followed by its free OOB,
+ * 64 times. Its size follows the map's page geometry. */
+#define AIROHA_IMAGE_STRIDE(t) ((airoha_u32)(t)->page_bytes + (t)->oob_bytes)
+#define AIROHA_IMAGE_BYTES(t) (AIROHA_BMT_BLOCK_PAGES * AIROHA_IMAGE_STRIDE(t))
+#define AIROHA_TRANSACTION_WORK_BYTES(t) (2u * AIROHA_IMAGE_BYTES(t))
 
 enum airoha_pool_role {
 	AIROHA_POOL_FREE, AIROHA_POOL_BAD, AIROHA_POOL_TABLE,
@@ -56,16 +58,17 @@ struct airoha_bmt_transaction {
 	struct airoha_bmt_data_io io;
 	struct airoha_bmt_flash publisher;
 	airoha_u32 first, end, bbt_block, bmt_block, journal_block, cursor;
-	airoha_u8 pool[250];
+	airoha_u8 pool[AIROHA_BMT_MAX_ENTRIES];	/* by reserve index, block - system */
 	airoha_u8 *image, *verify;
-	airoha_u8 expected[AIROHA_WRITE_PAGE], actual[AIROHA_WRITE_PAGE];
+	airoha_u8 expected[AIROHA_BMT_PAGE_MAX], actual[AIROHA_BMT_PAGE_MAX];
 	int ready, busy, failed, has_pending;
 	airoha_u32 remaps, recoveries, aborted, corrected_reads;
 };
 
 /* Verify inventory and recover before registering writable MTD or attaching
  * UBI. No callback is published by the binding on failure. Caller owns storage
- * and the two-image work allocation; NULL work is an allocation failure. */
+ * and the two-image work allocation (AIROHA_TRANSACTION_WORK_BYTES(map)); NULL
+ * work is an allocation failure. The map carries the page geometry. */
 int airoha_bmt_transaction_init(struct airoha_bmt_transaction *w,
 		struct airoha_bmt *map, const struct airoha_bmt_data_io *io,
 		airoha_u32 first, airoha_u32 end, airoha_u32 bbt_block,

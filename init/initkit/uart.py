@@ -188,12 +188,13 @@ class BootCatcher:
 PROMPTS = {
     'stock': re.compile(rb'(?:^|\n)ECNT>[ \t]*$'),
     'dumper': re.compile(rb'(?:^|\n)dumper>[ \t]*$'),
+    'restorer': re.compile(rb'(?:^|\n)restore>[ \t]*$'),
     'loader': re.compile(rb'(?:^|\n)SDR loader>[ \t]*$'),
     # BusyBox ash prints the working directory, `~` for root's home. Only these
     # two exact root-shell prompts count, not any `#` that boot output may end in.
     'linux': re.compile(rb'(?:^|\n)(?:/|~) #[ \t]*$'),
 }
-SETTLED = re.compile(r'(?:ECNT>|=>|dumper>|SDR loader>|(?:/|~) #)[ \t]*$')
+SETTLED = re.compile(r'(?:ECNT>|=>|dumper>|restore>|SDR loader>|(?:/|~) #)[ \t]*$')
 # How long the port must be silent at a prompt before a command counts as
 # finished: over a thousand byte-times at 115200 baud.
 QUIET_SETTLE = 0.1
@@ -203,7 +204,7 @@ MUTATING = re.compile(r'(?:^|[;&|]\s*)(?:erase|markbad)\b|'
                       r'\b(saveenv|env\s+save|ubi\s|mtd\s+(write|erase|markbad)|'
                       r'nand\s+(write|erase|markbad)|'
                       r'flash\s+(write|erase|upgrade|imgwrite)|'
-                      r'sf\s+(write|erase|update))', re.I)
+                      r'sf\s+(write|erase|update)|nandsync(?!\.check))', re.I)
 
 
 class Refused(Exception):
@@ -410,7 +411,7 @@ class ConsoleSession:
 
         `expect` is advisory: recorded, not required; callers check the output.
         `heartbeat` reports elapsed time every so many seconds and `about` is the
-        typical duration, because some commands (a whole-chip read) print nothing
+        typical duration, because some commands (reading all of the NAND) print nothing
         for a minute. The lock is released before reporting: the reader thread
         takes the log's lock before this one.
         """
@@ -463,6 +464,17 @@ class ConsoleSession:
         if not settled:
             raise RuntimeError(f'the console did not settle after {line!r}:\n{text[-800:]}')
         return text
+
+    def wake(self):
+        """Ask whatever is at the other end for a fresh prompt, transmitting Ctrl-C.
+
+        Not a newline: at a U-Boot prompt an empty line repeats the previous
+        command (after `tftpput`, the dumper would upload the whole backup again),
+        while Ctrl-C only discards the line. BusyBox ash prints a new prompt too.
+        """
+        self.check()
+        self.event('command', line='<ctrl-c>', mode='wake')
+        self._transmit(b'\x03', 'wake: Ctrl-C')
 
     def send_async(self, line):
         """Transmit a command without waiting for a prompt.

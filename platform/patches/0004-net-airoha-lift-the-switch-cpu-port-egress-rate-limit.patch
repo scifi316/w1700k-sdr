@@ -1,0 +1,34 @@
+SPDX-License-Identifier: GPL-2.0+
+Subject: [PATCH] net: airoha: lift the switch's CPU-port egress rate limit
+
+U-Boot configures the built-in switch without resetting it, so it inherits
+what the boot loader before it left. On the Gemtek W1700K that is an egress
+rate limit on the CPU port (ERLCR_P(6) = 0x009c8488: enabled, CIR 156 x 32
+kbit/s, counting CRC, IPG and preamble): every TFTP download ran at 5 Mbit/s
+on the wire, 0.57 MiB/s, whatever the block or window size. Clear it; with
+it gone a window-1 download runs at about 20 MiB/s.
+
+--- a/drivers/net/airoha_eth.c
++++ b/drivers/net/airoha_eth.c
+@@ -72,6 +72,7 @@
+ #define     SWITCH_FORCE_SPD_1000	FIELD_PREP(SWITCH_FORCE_SPD, 0x2)
+ #define   SWITCH_FORCE_DPX		BIT(1)
+ #define   SWITCH_FORCE_LNK		BIT(0)
++#define SWITCH_ERLCR(_n)		(0x1040 + ((_n) * 0x100))
+ #define SWITCH_SMACCR0			0x30e4
+ #define   SMACCR0_MAC2			GENMASK(31, 24)
+ #define   SMACCR0_MAC3			GENMASK(23, 16)
+@@ -792,6 +793,13 @@
+ 	airoha_switch_wr(eth, SWITCH_MFC, SWITCH_BC_FFP | SWITCH_UNM_FFP |
+ 			 SWITCH_UNU_FFP);
+ 
++	/*
++	 * The switch is not reset here, and the vendor boot loader that ran
++	 * before leaves an egress rate limit of about 5 Mbit/s on the CPU port:
++	 * every download crawled at 0.57 MiB/s. Lift it.
++	 */
++	airoha_switch_wr(eth, SWITCH_ERLCR(6), 0);
++
+ 	/* Set CPU 6 PMCR */
+ 	airoha_switch_wr(eth, SWITCH_PMCR(6),
+ 			 SWITCH_IPG_CFG_SHORT | SWITCH_MAC_MODE |

@@ -208,10 +208,12 @@
 	};
 };
 
-/* The two 10 GbE ports, wired as in OpenWrt: RTL8261N PHYs on the switch MDIO
- * bus over USXGMII, polarity inverted both ways. GDM2 is OpenWrt's wan
- * (PHY 8), GDM4 its lan2 (PHY 5). The PHY needs the rtl8261n.bin patch that
- * the kernel has built in.
+/* The two 10 GbE ports, wired as in OpenWrt: RTL8261N PHYs (W1700K) or
+ * RTL8261CE PHYs (W1700K2) on the switch MDIO bus over USXGMII, polarity
+ * inverted both ways on both. GDM2 is OpenWrt's wan (PHY 8), GDM4 its lan2
+ * (PHY 5). The generic C45 compatible lets the kernel pick the driver by the
+ * PHY's ID; each needs its firmware file (rtl8261n.bin, rtl_nic/rtl8261c.bin),
+ * both of which the kernel has built in.
  */
 &pon_pcs {
 	status = "okay";

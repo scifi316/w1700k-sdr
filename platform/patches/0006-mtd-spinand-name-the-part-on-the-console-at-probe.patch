@@ -1,0 +1,22 @@
+SPDX-License-Identifier: GPL-2.0+
+Subject: [PATCH] mtd: spinand: name the part on the console at probe
+
+The board takes a W25N04KV or a W25N04LV and the tools that write it need to
+know which one they talk to; dev_info() is silent here. Print the ID bytes
+and the geometry once when the chip is detected.
+
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -1483,6 +1483,12 @@
+ 		 "%llu MiB, block size: %zu KiB, page size: %zu, OOB size: %u\n",
+ 		 nanddev_size(nand) >> 20, nanddev_eraseblock_size(nand) >> 10,
+ 		 nanddev_page_size(nand), nanddev_per_page_oobsize(nand));
++	/* Always on the console: which part this is decides what may run on it. */
++	printf("spi-nand: %02x %02x %02x, %llu MiB, %zu KiB blocks of %u x (%zu + %u) bytes\n",
++	       spinand->id.data[0], spinand->id.data[1], spinand->id.data[2],
++	       nanddev_size(nand) >> 20, nanddev_eraseblock_size(nand) >> 10,
++	       nanddev_pages_per_eraseblock(nand), nanddev_page_size(nand),
++	       nanddev_per_page_oobsize(nand));
+ 
+ 	return 0;
+ }

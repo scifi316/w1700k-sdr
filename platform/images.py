@@ -13,7 +13,8 @@ Outputs in platform/build/images/:
                        adds the unit's keys)
   w1700k-recovery.itb  the same kernel and DTB with the root inside the
                        initramfs, booted from RAM by the loader for recovery
-  durable.ubifs        an empty UBIFS for the `durable` partition
+  durable-<part>.ubifs an empty UBIFS for the `durable` partition, one per
+                       NAND part (its LEB and page sizes are in the image)
 
 The FITs are parsed only by our loader, so their hashes are SHA-256.
 """
@@ -38,7 +39,6 @@ import uboot
 SYSTEM_FIT = IMAGES / 'w1700k-system.itb'
 RECOVERY_FIT = IMAGES / 'w1700k-recovery.itb'
 ROOTFS = IMAGES / 'rootfs.squashfs'
-DURABLE = IMAGES / 'durable.ubifs'
 BOOTSTRAP = BUILD / 'bootstrap/bootstrap.cpio.gz'
 RECOVERY_INITRD = BUILD / 'bootstrap/recovery.cpio.gz'
 BUSYBOX = BUILDROOT_OUT / 'target/bin/busybox'
@@ -185,7 +185,11 @@ def normalize_ubifs(data):
     return bytes(image)
 
 
-def durable():
+def durable_image(nand):
+    return IMAGES / nand.durable_image
+
+
+def durable(nand):
     mkfs = BUILDROOT_OUT / 'host/sbin/mkfs.ubifs'
     require(mkfs.is_file(), f'{mkfs} is missing; Buildroot builds it (BR2_PACKAGE_HOST_MTD)')
     with tempfile.TemporaryDirectory(prefix='durable-', dir=BUILD) as temporary:
@@ -195,10 +199,10 @@ def durable():
         raw = Path(temporary) / 'durable.ubifs'
         env = os.environ.copy()
         env.update(REPRODUCIBLE_ENV)
-        run([mkfs, '-U', '-r', tree, '-m', hex(partitions.PAGE_BYTES),
-             '-e', hex(partitions.LEB_BYTES), '-c', str(partitions.DURABLE_LEBS),
-             '-x', 'zstd', '-o', raw], env=env, log=LOG)
-        write_if_changed(DURABLE, normalize_ubifs(raw.read_bytes()))
+        run([mkfs, '-U', '-r', tree, '-m', hex(nand.page), '-e', hex(nand.leb),
+             '-c', str(partitions.durable_lebs(nand)), '-x', 'zstd', '-o', raw],
+            env=env, log=LOG)
+        write_if_changed(durable_image(nand), normalize_ubifs(raw.read_bytes()))
 
 
 def main():
@@ -214,8 +218,10 @@ def main():
     require(SYSTEM_FIT.stat().st_size <= partitions.FIT_VOLUME_BYTES,
             'the system FIT does not fit its volume')
     build_fit(RECOVERY_FIT, 'W1700K SDR recovery', RECOVERY_INITRD)
-    durable()
-    for path in (SYSTEM_FIT, ROOTFS, RECOVERY_FIT, DURABLE):
+    for nand in partitions.NANDS:
+        durable(nand)
+    for path in (SYSTEM_FIT, ROOTFS, RECOVERY_FIT,
+                 *(durable_image(nand) for nand in partitions.NANDS)):
         print(f'images: {path} ({path.stat().st_size} bytes)')
     return 0
 

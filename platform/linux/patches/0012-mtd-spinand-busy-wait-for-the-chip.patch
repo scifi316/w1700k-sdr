@@ -1,0 +1,74 @@
+SPDX-License-Identifier: GPL-2.0-only
+Subject: [PATCH] mtd: spinand: busy-wait for the chip
+
+This kernel has no high-resolution timers, so the usleep_range() between
+spi_mem_poll_status()'s status reads sleeps a whole tick, 4 ms at HZ=250:
+every page read, program and erase took at least that long. Measured on a
+W1700K2 with the W25N04KV: 0.49 MB/s reading an MTD partition, 54 s to sync
+8 MiB, where our U-Boot, which polls with udelay(), reads 7.9 MB/s. Poll the
+status register with udelay() between reads, as U-Boot does. A timeout or a
+failed status read still stops the system (0008).
+
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -9,7 +9,9 @@
+ 
+ #define pr_fmt(fmt)	"spi-nand: " fmt
+ 
++#include <linux/delay.h>
+ #include <linux/device.h>
++#include <linux/iopoll.h>
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+@@ -550,36 +552,26 @@
+ int spinand_wait(struct spinand_device *spinand, unsigned long initial_delay_us,
+ 		 unsigned long poll_delay_us, u8 *s)
+ {
+-	struct spi_mem_op op = SPINAND_GET_FEATURE_1S_1S_1S_OP(REG_STATUS,
+-							       spinand->scratchbuf);
+-	u8 status;
+-	int ret;
+-
+-	ret = spi_mem_poll_status(spinand->spimem, &op, STATUS_BUSY, 0,
+-				  initial_delay_us,
+-				  poll_delay_us,
+-				  SPINAND_WAITRDY_TIMEOUT_MS);
+-	if (ret)
+-		panic("SPI NAND completion unknown (%d); reset required", ret);
+-
+-	status = *spinand->scratchbuf;
+-	if (!(status & STATUS_BUSY))
+-		goto out;
++	u8 status = STATUS_BUSY;
++	int ret, read_ret;
+ 
+ 	/*
+-	 * Extra read, just in case the STATUS_READY bit has changed
+-	 * since our last check
++	 * Busy-wait. Without high-resolution timers (this kernel has none) the
++	 * usleep_range() between spi_mem_poll_status()'s status reads sleeps a
++	 * whole tick, 4 ms at HZ=250, while the chip is done in tens of
++	 * microseconds (read), hundreds (program) or a few milliseconds (erase).
++	 * The poll ends only with the chip ready, a failed read or a timeout.
+ 	 */
+-	ret = spinand_read_status(spinand, &status);
+-	if (ret)
+-		panic("SPI NAND completion unknown (%d); reset required", ret);
++	udelay(initial_delay_us);
++	ret = read_poll_timeout_atomic(spinand_read_status, read_ret,
++				       read_ret || !(status & STATUS_BUSY),
++				       poll_delay_us, SPINAND_WAITRDY_TIMEOUT_MS * 1000,
++				       false, spinand, &status);
++	if (ret || read_ret)
++		panic("SPI NAND completion unknown (%d); reset required", ret ? ret : read_ret);
+ 
+-out:
+ 	if (s)
+ 		*s = status;
+-
+-	if (status & STATUS_BUSY)
+-		panic("SPI NAND still busy; reset required");
+ 	return 0;
+ }
+ 

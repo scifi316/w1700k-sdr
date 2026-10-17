@@ -1,0 +1,68 @@
+SPDX-License-Identifier: GPL-2.0+
+Subject: [PATCH] mtd: spinand: winbond: add the W25N04LV
+
+Some Gemtek W1700K2 (HW 2.1) units carry a W25N04LV (ID ef 8b 23) in place
+of the W25N04KV: 512 MiB as 2048 blocks of 64 pages of 4096 + 256 bytes, one
+plane, 8-bit ECC per 512-byte step on the die, with the W25N04KV's ECC status
+and its spare layout at twice the size (free bytes 2-15 of each of eight
+16-byte groups, parity from byte 128). The same entry appears in OpenWrt PR
+#25532 (written on a 2.1 unit with this chip), Rockchip's and an Airoha
+U-Boot fork's tables; the stock U-Boot of the W1700K and of the 2.1 units
+seen so far does not know the part.
+
+--- a/drivers/mtd/nand/spi/winbond.c
++++ b/drivers/mtd/nand/spi/winbond.c
+@@ -181,6 +181,37 @@
+ 	.rfree = w25n02kv_ooblayout_free,
+ };
+ 
++/* The W25N04KV's layout at twice the size: eight 16-byte spare groups, user
++ * bytes 2-15 of each free, each 512-byte step's 13 parity bytes from 128. */
++static int w25n04lv_ooblayout_ecc(struct mtd_info *mtd, int section,
++				  struct mtd_oob_region *region)
++{
++	if (section > 7)
++		return -ERANGE;
++
++	region->offset = 128 + (16 * section);
++	region->length = 13;
++
++	return 0;
++}
++
++static int w25n04lv_ooblayout_free(struct mtd_info *mtd, int section,
++				   struct mtd_oob_region *region)
++{
++	if (section > 7)
++		return -ERANGE;
++
++	region->offset = (16 * section) + 2;
++	region->length = 14;
++
++	return 0;
++}
++
++static const struct mtd_ooblayout_ops w25n04lv_ooblayout = {
++	.ecc = w25n04lv_ooblayout_ecc,
++	.rfree = w25n04lv_ooblayout_free,
++};
++
+ static int w35n01jw_ooblayout_ecc(struct mtd_info *mtd, int section,
+ 				  struct mtd_oob_region *region)
+ {
+@@ -489,6 +520,15 @@
+ 					      &update_cache_variants),
+ 		     0,
+ 		     SPINAND_ECCINFO(&w25n02kv_ooblayout, w25n02kv_ecc_get_status)),
++	SPINAND_INFO("W25N04LV", /* 3.3V, 4 KiB pages */
++		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0x8b, 0x23),
++		     NAND_MEMORG(1, 4096, 256, 64, 2048, 40, 1, 1, 1),
++		     NAND_ECCREQ(8, 512),
++		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants,
++					      &write_cache_variants,
++					      &update_cache_variants),
++		     0,
++		     SPINAND_ECCINFO(&w25n04lv_ooblayout, w25n02kv_ecc_get_status)),
+ 	SPINAND_INFO("W25N04KW", /* 1.8V */
+ 		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0xba, 0x23),
+ 		     NAND_MEMORG(1, 2048, 128, 64, 4096, 40, 1, 1, 1),

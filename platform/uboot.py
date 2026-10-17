@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Shared steps of the two U-Boot builds (loader and dumper) and of mkimage."""
+"""Shared steps of the U-Boot builds (loader, dumper, restorer) and of mkimage."""
 from pathlib import Path
 import struct
 
@@ -13,13 +13,14 @@ ENTRY = 0x80200000           # where stock and our loader place the payload
 FDT_LOAD = 0x82000000
 RAM_END = 0x100000000
 SHARED_PATCHES = sorted((Path(__file__).resolve().parent / 'patches').glob('*.patch'))
-# The board support patch (entry address, single 2 GiB DRAM bank) both images use.
+# The board support patch (entry address, single 2 GiB DRAM bank) every image uses.
 BOARD_PATCH = (Path(__file__).resolve().parent /
                'loader/patches/0001-w1700k-sdr-entry-and-dram.patch')
 
 
-def prepare(name, patches, files):
-    """A U-Boot tree with `patches` applied and `files` ({dest: source}) copied in."""
+def prepare(name, patches, files, policy=None):
+    """A U-Boot tree with `patches` applied, `files` ({dest: source}) copied in and
+    the BMT write policy header (`policy`, default our loader's) generated."""
     src = SRC / f'u-boot-{name}'
     stamp = patch_stamp(patches) + sources()['u-boot']['sha256']
     if not prepared(src, stamp):
@@ -29,7 +30,8 @@ def prepare(name, patches, files):
         mark_prepared(src, stamp)
     for dest, source in files.items():
         copy_if_changed(source, src / dest)
-    write_if_changed(src / 'drivers/mtd/nand/airoha_bmt_policy.h', partitions.policy_header())
+    write_if_changed(src / 'drivers/mtd/nand/airoha_bmt_policy.h',
+                     policy or partitions.policy_header())
     return src
 
 

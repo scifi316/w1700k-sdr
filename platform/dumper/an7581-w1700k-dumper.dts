@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /dts-v1/;
 
-// No memory reservations: this image reads the whole chip into one buffer at
-// 0x90000000, sends it over TFTP and boots nothing else.
+// No memory reservations: the dumper and the restorer (which shares this tree)
+// hold NAND data in RAM from 0x90000000 and boot nothing else.
 
 #include "en7581.dtsi"
 
@@ -31,5 +31,5 @@
 
 &{/soc/spi@1fa10000} { status = "okay"; };
 
-// No partitions: this image reads the whole chip, untranslated.
+// No partitions: the dumper and the restorer address the chip as a whole.
 &spi_nand { status = "okay"; };

@@ -52,7 +52,8 @@ ENABLED = ('AN7581_W1700K_SDR', 'POSITION_INDEPENDENT', 'LINUX_KERNEL_IMAGE_HEAD
 DISABLED = ('ENV_IS_NOWHERE', 'ENV_IS_IN_MTD', 'BOOTSTD', 'EFI_LOADER', 'MMC', 'PCI',
             'USB', 'CMD_GO')
 LINKED = ('airoha_bmt_attach', 'airoha_bmt_translate', 'airoha_bmt_transaction_recover',
-          'airoha_bmt_publish', 'env_ubi_media_ready', 'ubi_part_ro', 'ubi_part_rw')
+          'airoha_bmt_publish', 'airoha_bmt_vendor_pool', 'env_ubi_media_ready', 'ubi_part_ro',
+          'ubi_part_rw', 'w25n04lv_ooblayout_ecc')
 
 
 def patches():
@@ -93,6 +94,9 @@ def main():
     require(not missing, 'loader: not linked: ' + ', '.join(missing))
     # OpenWrt's mtk_bmt rewrites a vendor BMT it fails to parse.
     require('mtk_bmt_attach' not in linked, 'loader: mtk_bmt is linked')
+    # Untranslated access is for the read-only dumper; here a write would land
+    # on other blocks than stock reads.
+    require('do_bmtdetach' not in linked, 'loader: bmtdetach is linked')
 
     payload = BUILD / 'loader/u-boot.bin.lzma'
     write_if_changed(payload, compress(image))

@@ -1,10 +1,12 @@
-# Installing and updating a unit
+# Installing, updating and restoring a unit
 
-`init/install` takes a W1700K running its stock firmware, backs up its whole
-NAND to the host, and installs the SDR system. `init/flash` updates an installed
-unit from a new build. Both drive the unit over its serial console and serve
-images to its U-Boot over TFTP; neither needs the unit's stock firmware to work
-beyond its first-stage U-Boot.
+`init/install` takes a W1700K running its stock firmware, backs up its NAND
+data to the host, and installs the SDR system. `init/flash` updates an installed
+unit from a new build. `init/restore` writes the backup back and returns the
+unit to its stock firmware. `init/rawdump` takes a raw image of the whole NAND
+for the maintainers. All of them drive the unit over its serial console and
+serve images to its U-Boot over TFTP; none needs the unit's stock firmware to
+work beyond its first-stage U-Boot.
 
 ## What you need
 
@@ -45,9 +47,11 @@ init/install               # then power the unit on when asked
 
 It stops stock U-Boot at power-on and then:
 
-1. boots the write-free dumper from RAM, reads the unit's serial number, and
-   copies the whole NAND (data and OOB, 544 MiB) to
-   `~/.local/share/w1700k/units/SERIAL/nand-raw.bin`;
+1. boots the write-free dumper from RAM, names the NAND part (see below),
+   reads the unit's serial number, and copies the NAND's data as stock
+   firmware addresses it (through the vendor's bad-block tables, every page
+   corrected by the chip's ECC; 446 MiB) to
+   `~/.local/share/w1700k/units/SERIAL/nand.bin`;
 2. saves the unit's radio calibration (its MT7996 EEPROM image, from the
    `calibration` partition in the backup) as `eeprom.bin` beside the backup,
    where the host tools find it; `init/eeprom --unit SERIAL` does the same for
@@ -63,15 +67,56 @@ It stops stock U-Boot at power-on and then:
 7. boots the installed system and checks it.
 
 The unit is then reachable with `ssh root@192.168.1.1`. A full run takes about
-ten minutes. Every step is checked before the next one starts; if a run is
+five minutes. Every step is checked before the next one starts; if a run is
 interrupted, run it again: the backup is kept and is never overwritten.
 `--expect-serial SERIAL` stops before anything is written unless the unit is
 the one you meant, and `--backup-only` stops after the backup.
 
 The backup is the only copy of the stock firmware and of the unit's factory
 data (it includes the unit's stock passwords). Keep it. Steps 4 to 6 replace
-the stock operating system; restoring it means writing the backup back with a
-raw NAND writer, which this repository does not provide.
+the stock operating system; `init/restore` puts it back (below).
+
+### The NAND part
+
+The W1700K and most W1700K2s carry a W25N04KV, on which all of this has run.
+Some W1700K2s carry a W25N04LV (4 KiB pages, 256 KiB blocks, ID `ef 8b 23`).
+It is supported throughout (our U-Boots, Linux, the bad-block engine, the
+images, backup, restore), but has never been run on a unit, so the installer
+stops on one, before the backup and with nothing written:
+
+```
+UNTESTED NAND IC DETECTED!
+PLEASE SEND RAW NAND DUMP TO MAINTAINERS.
+Restart with --i-dont-care-about-nand-corruption to continue at your own risk.
+```
+
+Take the raw dump first (`init/rawdump`, below) and send it in: it is what
+confirms or corrects how the part is handled, its spare layout (where the
+chip keeps the free bytes and the ECC parity of a written page) and its
+vendor bad-block tables among them. Its bad-block reserve follows the vendor
+rule read from the W1700K's stock U-Boot, which does not know the part (see
+`platform/README.md`). Before writing, the installer checks that rule against
+the pool the unit's own stock U-Boot prints at its boot, and stops on a
+difference; vendor tables that do not validate under it are refused too. Both
+stops write nothing, flag or not. `--backup-only` needs no flag, and
+`init/restore` needs the same flag on such a part. Any other part is refused.
+
+## Raw NAND dump
+
+```sh
+init/rawdump                   # to ~/.local/share/w1700k/units/SERIAL/nand-raw.bin
+init/rawdump --output FILE
+```
+
+The dumper drops the vendor translation and reads every page of the chip with
+the ECC off: every page's main area in physical order, then every page's OOB
+(544 MiB on either part), hashed on the device and checked on the host.
+`nand-raw.json` beside it records the part, its geometry, the layout, whether
+the vendor tables validated, and the SHA-256. Nothing is written to the unit,
+which is reset afterwards and boots as before. It takes about three minutes.
+The image carries the chip's uncorrected bit errors and is not a backup;
+restores use `nand.bin`. Like the backup it holds the unit's stock passwords:
+send it to the maintainers only.
 
 ## Updates
 
@@ -80,7 +125,7 @@ make
 init/flash --system        # kernel, device tree and root
 init/flash --loader        # our U-Boot
 init/flash --durable       # erase durable storage
-init/flash --detect-only   # report where the unit is; sends one newline
+init/flash --detect-only   # report where the unit is; sends one Ctrl-C
 ```
 
 `init/flash` works from whatever state the unit is in (Linux, any U-Boot
@@ -88,6 +133,40 @@ prompt, or powered off, in which case it asks for a power cycle), writes only
 what was asked, skips a volume that already holds the new bytes, reads every
 write back, and boots the result. `--rootfs` and `--fit` update one volume of
 the system each. With more than one installed unit, name it with `--unit SERIAL`.
+
+## Returning to stock
+
+```sh
+init/restore                   # the backup init/install took of the connected unit
+init/restore --unit SERIAL     # the same, but stop unless the unit is SERIAL
+init/restore --backup FILE     # another backup file of the connected unit
+init/restore --force           # past a serial or calibration mismatch (below)
+```
+
+On a W25N04LV it also needs `--i-dont-care-about-nand-corruption` (see "The
+NAND part" above).
+
+The restorer reads the unit's serial from its calibration partition; the backup
+must hold the same serial, and the vendor boot stages and the calibration
+partition (which holds the serial) must still match it, or nothing is written.
+Those two are never written. `--force` restores the rest anyway, reporting the
+mismatch: another unit's stock firmware onto this one, or a unit whose
+calibration partition is damaged (it keeps its own, as it is).
+
+From whatever state the unit is in, it stops stock U-Boot and boots the
+restorer from RAM through it, as the installer boots the dumper, so a unit
+whose installed loader no longer starts is restored all the same. The
+restorer lifts the switch's 5 Mbit/s CPU-port limit that stock leaves behind,
+receives the whole backup gzip-compressed (90 to 150 MiB for a stock unit,
+seconds at about 20 MiB/s), unpacks it and checks its SHA-256 in RAM, and
+checks that the vendor boot stages and calibration, which nothing here writes,
+still match it.
+On the device, `nandsync` then compares every block of stock's images, then of
+stock's environment, with RAM, and erases, writes and reads back only the
+blocks that differ, through the vendor bad-block tables with the chip's ECC on.
+Everything written is compared once more, and the unit resets into its stock
+firmware. Nothing is sent back to the host. It takes three to seven minutes,
+most of it rewriting what changed (about ten blocks a second).
 
 ## Recovery
 
@@ -104,7 +183,7 @@ the system each. With more than one installed unit, name it with `--unit SERIAL`
 
 | Path | Contents |
 | --- | --- |
-| `~/.local/share/w1700k/units/SERIAL/` | `nand-raw.bin` (the backup), `dropbear_ed25519_host_key`, `rootfs.squashfs` (the unit's root), optional `network.conf` |
+| `~/.local/share/w1700k/units/SERIAL/` | `nand.bin` (the backup), `dropbear_ed25519_host_key`, `rootfs.squashfs` (the unit's root), optional `network.conf`, `nand-raw.bin` and `nand-raw.json` after `init/rawdump` |
 | `~/.local/share/w1700k/runs/` | one directory per run: the raw console transcript (`rx.bin`), an event log and saved command output |
 
 A `network.conf` in the unit directory replaces the unit's
@@ -120,13 +199,14 @@ the console to you for the rest of the run.
 | --- | --- |
 | `initkit/uart.py` | console session: raw transcript, stopping autoboot, running commands to a prompt |
 | `initkit/tftp.py` | TFTP server (also usable by hand: `python3 init/initkit/tftp.py --help`) |
-| `initkit/console.py` | checked commands and moving between stock, dumper, loader and Linux |
+| `initkit/console.py` | checked commands and moving between stock, dumper, restorer, loader and Linux |
 | `initkit/stock.py` | getting an image into RAM through stock U-Boot's TFTP |
-| `initkit/backup.py` | serial number and whole-chip backup, from the dumper |
+| `initkit/backup.py` | serial number and the backup of the NAND data, from the dumper |
+| `initkit/nand.py` | which NAND part the unit carries, and the stop for an untested one |
 | `initkit/layout.py` | the U-Boot commands that lay out NAND, from `platform/partitions.py` |
 | `initkit/steps.py` | the write steps, each read back |
 | `initkit/provision.py` | the unit's root filesystem with its keys |
-| `initkit/install.py`, `initkit/update.py` | the two procedures |
+| `initkit/install.py`, `initkit/update.py`, `initkit/restore.py`, `initkit/rawdump.py` | the procedures |
 
 Stock U-Boot's TFTP client gives up after ten timeouts that its broken timer
 spends at about a hundred per second, so images go to stock in 32 KiB pieces,

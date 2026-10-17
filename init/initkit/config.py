@@ -21,7 +21,8 @@ DUMPER = IMAGES / 'w1700k-dumper.itb'
 SYSTEM_FIT = IMAGES / 'w1700k-system.itb'
 RECOVERY_FIT = IMAGES / 'w1700k-recovery.itb'
 ROOTFS = IMAGES / 'rootfs.squashfs'
-DURABLE = IMAGES / 'durable.ubifs'
+# One empty durable UBIFS per NAND part (platform/partitions.py NANDS).
+DURABLES = tuple(IMAGES / nand.durable_image for nand in partitions.NANDS)
 # unsquashfs and mksquashfs, built by Buildroot, make the per-unit root.
 SQUASHFS_TOOLS = ROOT / 'platform/build/buildroot/host/bin'
 
@@ -100,6 +101,10 @@ def pick_unit(data_dir, serial=None):
         raise SystemExit('name the unit with --unit SERIAL; known units: '
                          + (', '.join(units) or 'none'))
     return units[0]
+
+
+def durable(nand):
+    return IMAGES / nand.durable_image
 
 
 def require_images(*paths):

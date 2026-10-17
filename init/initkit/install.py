@@ -2,8 +2,10 @@
 """Install the SDR system on a unit running stock firmware.
 
     1. stop stock U-Boot at power-on and record its environment
-    2. boot the write-free dumper from RAM, read the unit's serial and back up
-       the whole NAND to the host (skipped when a backup of this unit exists)
+    2. boot the write-free dumper from RAM, name the NAND part (a part never
+       run on a unit stops here unless the user accepts the risk), read the
+       unit's serial and back up its NAND data, as stock addresses it, to the
+       host (skipped when a backup of this unit exists)
     3. build the unit's root with its SSH keys
     4. write our loader into the `loader` partition through stock, read it back
        and boot that copy
@@ -16,23 +18,49 @@
 Steps 4 to 7 replace the stock firmware; the backup from step 2 is the only copy
 of it. Interrupted at any point, the installation can be run again.
 """
-from . import backup, config, layout, provision, stock, steps
+from . import backup, config, layout, nand as parts, provision, stock, steps
 from . import console as unit
 from .console import StepFailed
 from .session import open_session
 
 
+def examine(console, log, backup_only, accept_untested):
+    """At the dumper: the NAND part, checked to be one this layout supports and
+    translated and, unless `backup_only`, run on a unit before (or accepted) and
+    with the vendor pool stock reported at its boot; returns (part, serial)."""
+    listing = backup.list_chip(console, log)
+    nand = parts.identify(listing)
+    stock_pool, pool = parts.pools(console.view(), listing)
+    print(f'install: NAND {nand.name} (ID {nand.id.hex(" ")}), vendor pool {pool} '
+          f'(stock: {stock_pool})')
+    if backup_only and not nand.tested:
+        print(f'install: the {nand.name} has not been run on a unit by this project; '
+              'the backup writes nothing')
+    elif not backup_only:
+        parts.require_tested(nand, accept_untested)
+    try:
+        backup.check_translated(listing)
+    except StepFailed as error:
+        if nand.tested:
+            raise
+        raise StepFailed(f'{error}\n{parts.SEND_DUMP}') from None
+    if not backup_only:
+        parts.check_pool(nand, console.view(), listing)
+    return nand, backup.read_serial(console)
+
+
 def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
-        force=False, backup_only=False):
+        force=False, backup_only=False, accept_untested=False):
     if backup_only:
         config.require_images(config.DUMPER)
     else:
         config.require_images(config.LOADER, config.DUMPER, config.SYSTEM_FIT,
-                              config.ROOTFS, config.DURABLE)
+                              config.ROOTFS, *config.DURABLES)
         provision.authorized_key(authorized_key)   # fail before touching the unit
     with open_session(settings, 'install', write=not backup_only) as session:
         console, log = session.console, session.log
-        unit.to_stock(console, log, unit.identify(console, log))
+        # Stock's own boot is seen, for the vendor pool it reports.
+        unit.to_stock(console, log, unit.identify(console, log), fresh=True)
 
         environment = stock.environment(console)
         log.text('stock-environment.txt', '\n'.join(f'{key}={value}' for key, value
@@ -45,7 +73,7 @@ def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
         print('install: booting the write-free dumper')
         stock.stage(console, log, settings, config.DUMPER, session.served)
         stock.boot(console, 'dumper')
-        serial = backup.read_serial(console)
+        nand, serial = examine(console, log, backup_only, accept_untested)
         if expect_serial and serial != expect_serial:
             raise StepFailed(f'this unit is {serial}, not {expect_serial}; nothing was written')
         directory = config.unit_dir(settings.data_dir, serial)
@@ -57,7 +85,7 @@ def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
                 raise StepFailed(f'{existing} holds another unit; move it away first')
             print(f'install: keeping the existing backup {existing}')
         else:
-            print('install: backing up the whole NAND')
+            print('install: backing up the NAND data')
             backup.dump(console, log, settings, session.served, directory, serial)
         calibration = backup.extract_eeprom(existing, directory)
         print(f'install: radio calibration saved to {calibration}')
@@ -72,8 +100,8 @@ def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
         unit.to_stock(console, log, 'dumper')
         extent = steps.write_loader_slot(session)
         print('install: laying out system and durable storage')
-        steps.format_system(session, config.SYSTEM_FIT, rootfs)
-        steps.format_durable(session)
+        steps.format_system(session, config.SYSTEM_FIT, rootfs, nand)
+        steps.format_durable(session, nand)
 
         print('install: making stock U-Boot boot our loader')
         unit.to_stock(console, log, 'loader')

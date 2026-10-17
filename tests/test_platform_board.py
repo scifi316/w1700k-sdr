@@ -96,6 +96,8 @@ class LinkedKernel(unittest.TestCase):
             board_check.linked(system_map + '\nffff0000 T mtk_bmt_attach')
         with self.assertRaisesRegex(Exception, 'sdr_bmt_attach'):
             board_check.linked(system_map.replace('sdr_bmt_attach', 'other'))
+        with self.assertRaisesRegex(Exception, 'rtl8261c'):
+            board_check.linked(system_map.replace('_fw_rtl_nic_rtl8261c_bin_bin', 'other'))
 
 
 if __name__ == '__main__':

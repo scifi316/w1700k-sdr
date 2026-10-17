@@ -24,8 +24,9 @@ starts Dropbear for key-only root logins. Nothing at startup writes NAND.
 | sdr | `make -C linux module reader` | `kernel/w1700k_sdr/build/`: the module and the four clients |
 | rootfs | `rootfs/build.py image` | `buildroot/images/rootfs.squashfs` with the driver and clients |
 | loader | `loader/build.py` | `images/w1700k-loader.itb` (and `mkimage/`) |
-| images | `images.py` | `images/w1700k-system.itb`, `w1700k-recovery.itb`, `rootfs.squashfs`, `durable.ubifs` |
+| images | `images.py` | `images/w1700k-system.itb`, `w1700k-recovery.itb`, `rootfs.squashfs`, `durable-w25n04kv.ubifs`, `durable-w25n04lv.ubifs` |
 | dumper | `dumper/build.py` | `images/w1700k-dumper.itb` |
+| restorer | `restorer/build.py` | `images/w1700k-restorer.itb` |
 
 A first build downloads about 500 MB of sources and builds a GCC toolchain;
 on a 20-core host the whole `make` takes about ten minutes plus the downloads.
@@ -43,8 +44,9 @@ ship uutils), `gnuinstall` or `ginstall` must exist.
 
 [`sources.json`](sources.json) pins every upstream input: Buildroot by tag and
 commit, Linux and U-Boot by tarball SHA-256, the OpenWrt tree (kernel patches,
-the Airoha device tree and the RTL8261N PHY firmware generator) by commit, and
-the PHY firmware's own generator files and output by SHA-256.
+the Airoha device tree and the RTL8261N PHY firmware generator) by commit, the
+PHY firmware's own generator files and output by SHA-256, and the RTL8261CE's
+firmware file (the W1700K2's PHY) from linux-firmware by commit and SHA-256.
 [`fetch.py`](fetch.py) downloads and checks them; `W1700K_OPENWRT_GIT` points it
 at another OpenWrt repository (for example a local mirror) while still
 requiring the pinned commit.
@@ -56,18 +58,30 @@ requiring the pinned commit.
 | `rootfs/` | Buildroot configuration and the overlay: init scripts, network and storage configuration, `verify-storage`, the `durable-*` helpers |
 | `linux/` | kernel configuration, the board device tree, our kernel patches, the Linux BMT binding, `board_check.py` |
 | `loader/` | our U-Boot: defconfig, default environment, device tree, patches, the U-Boot BMT binding |
-| `dumper/` | the write-free dumper: defconfig, environment, device tree, patches |
-| `patches/` | U-Boot patches both the loader and the dumper carry |
-| `bmt/` | the vendor bad-block translation and replacement engine, shared by both U-Boots and Linux, and its C test harnesses |
+| `dumper/` | the write-free dumper: defconfig, environment, device tree, patches; it links the loader's BMT binding read side only, with `bmtdetach` for raw dumps |
+| `restorer/` | the restorer that writes a backup back: defconfig, environment, patches (`nandsync`); the dumper's device tree |
+| `patches/` | U-Boot patches the loader, the dumper and the restorer all carry (among them the W25N04LV and the part named at probe) |
+| `bmt/` | the vendor bad-block translation and replacement engine, shared by our U-Boots and Linux, and its C test harnesses |
 | `bootstrap/` | the initramfs `init` that mounts the root |
-| `partitions.py` | the NAND layout, generated into both device trees and the BMT policy header |
+| `partitions.py` | the NAND parts and layout, generated into both device trees and the BMT policy header |
 
 ## NAND
 
-512 MiB SPI-NAND, 128 KiB blocks, 2 KiB pages. Offsets are vendor-logical: every
-stage translates them through the vendor's bad-block tables (BBT shift, then BMT
-substitution) exactly as stock U-Boot does, so all stages agree on where a
-partition is.
+512 MiB SPI-NAND: a W25N04KV (128 KiB blocks, 2 KiB pages) or, on some
+W1700K2s, a W25N04LV (256 KiB blocks, 4 KiB pages). Offsets are vendor-logical:
+every stage translates them through the vendor's bad-block tables (BBT shift,
+then BMT substitution) exactly as stock U-Boot does, so all stages agree on
+where a partition is. The partitions are the same bytes on both parts, every
+boundary on a 256 KiB block; the UBI volumes are sized per part.
+
+The vendor reserve is 250 blocks on the W25N04KV, fixed by the 250-entry tables.
+On the W25N04LV it is what stock's boot computes from the factory bad-block
+markers: 163 good blocks counted down from the last, plus the factory-bad
+blocks among them (U-Boot `0x81e1b540`), and the BMT checksum covers that many
+entries. That rule is read from the W1700K's stock U-Boot, which does not know
+the W25N04LV; a unit with that part ships a newer one, and nothing here has
+read its tables yet. Tables that do not validate under the rule are refused,
+never rewritten.
 
 | Partition | Offset | Size | Contents | Linux |
 | --- | --- | --- | --- | --- |
@@ -80,9 +94,22 @@ partition is.
 | `scratch` | 0x5800000 | 358 MiB | unused | read-only |
 | `reserved-bmt` | 0x1be00000 | 66 MiB | vendor bad-block reserve pool | read-only |
 
-The BMT layer replaces blocks that wear out (journalled, so an interrupted
-replacement recovers on the next boot) and only ever writes inside
-`system`..`scratch`.
+Writes program erased pages directly, in ascending order, and read each page
+back: a block's state is known from an erase in the same boot or, the first
+time it is written in a boot, from reading its pages down to the highest one in
+use (UBI keeps its free blocks erased across boots). One program per page, one
+erase per block reused. The BMT layer replaces a block only when a program or
+erase fails (journalled in the block after the BBT, so an interrupted
+replacement recovers on the next boot), and only ever writes inside
+`system`..`scratch` (the restorer: `uenv`..`scratch`, except `calibration`). It
+writes only while the BBT is the reserve's first good block, as the vendor
+places it: otherwise the pool it computed is not the one stock computes. A set
+factory marker is read twice in the pool scan (the byte has no ECC). Before
+anything is written, the installer and the restorer check that the pool stock
+U-Boot printed at its boot in the same run (`bmt pool size: N`) is the one our
+U-Boot computed. Linux waits for the chip by polling its status with `udelay()`
+(patch 0012): the kernel has no high-resolution timers, so a sleeping poll
+would take a 4 ms tick per page.
 
 ## Checks in the build
 
@@ -90,7 +117,8 @@ The build stops when an output is wrong rather than leaving it for the unit to
 find: requested kernel options that Kconfig dropped, a device tree whose
 devices, 10 GbE wiring, reserved memory or partitions differ from the design,
 OpenWrt's `mtk_bmt` linked into a kernel or loader (it rewrites vendor tables it
-fails to parse), any NAND write path linked into the dumper, a U-Boot runtime
-that would overlap its staging area, or an image that does not fit its
-partition or volume. `make check` runs the unit tests, including the BMT layer
-compiled for the host.
+fails to parse), any NAND write path or the BMT write engine linked into the
+dumper, `bmtdetach` (untranslated access) in any stage that can write, a
+restorer without its write path, a U-Boot runtime that would overlap its
+staging area, or an image that does not fit its partition or volume. `make check` runs the unit tests, including the BMT layer
+compiled for the host, every harness once per NAND part.

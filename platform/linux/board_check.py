@@ -23,10 +23,14 @@ TEN_GIGABIT = (('gdm2', 'pon_pcs', 'phy8', 8, 31), ('gdm4', 'eth_pcs', 'phy5', 5
 # Firmware and DMA regions the SoC uses before and while Linux runs.
 RESERVED = {'atf': (0x80000000, 0x200000), 'npu_binary': (0x84000000, 0xa00000),
             'qdma0_buf': (0x87000000, 0x2000000), 'qdma1_buf': (0x89000000, 0x1000000)}
+# The 10 GbE PHY drivers of both board variants and their built-in firmware,
+# RTL8261N (W1700K) and RTL8261CE (W1700K2), are among them, and the W25N04LV
+# that some W1700K2s carry instead of the W25N04KV.
 LINKED = ('airoha_probe', 'mtk_pcie_probe', 'an7581_phy_probe', 'airoha_snand_probe',
           'spinand_probe', 'ubi_attach_mtd_dev', 'ubifs_read_superblock',
           'sdr_bmt_attach', 'airoha_bmt_translate', 'airoha_bmt_transaction_recover',
-          'airoha_bmt_publish')
+          'airoha_bmt_publish', 'rtl826x_probe', 'rtl8261x_probe', 'rtl8261x_config_init',
+          '_fw_rtl8261n_bin_bin', '_fw_rtl_nic_rtl8261c_bin_bin', 'w25n04lv_ooblayout_ecc')
 NOT_LINKED = ('mtk_bmt_attach', 'airoha_npu_probe')
 
 

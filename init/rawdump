@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Take a raw image of the unit's whole NAND, for the maintainers.
+
+    init/rawdump                 # to nand-raw.bin in the unit's directory
+    init/rawdump --output FILE   # to FILE
+
+Stock U-Boot boots the write-free dumper from RAM; the dumper reads every page
+of the chip with the ECC off, main area and OOB, and sends it to this host.
+Nothing is written to the unit, which is reset afterwards and boots as before.
+nand-raw.json beside the image describes it. The image holds the unit's stock
+credentials: send it to the maintainers only. It is not a backup; see
+init/README.md.
+"""
+import argparse
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from initkit import config, rawdump, session          # noqa: E402
+from initkit.console import StepFailed                # noqa: E402
+
+
+def main():
+    settings = config.load()
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    config.add_arguments(parser, settings)
+    parser.add_argument('--output', metavar='FILE', type=Path,
+                        help='where to put the image (default: nand-raw.bin in the unit '
+                             'directory); never overwritten')
+    args = parser.parse_args()
+    try:
+        rawdump.run(session.settings_from(args), args.output)
+        return 0
+    except (StepFailed, RuntimeError) as error:
+        sys.exit(f'rawdump: {error}')
+    except KeyboardInterrupt:
+        sys.exit('rawdump: interrupted')
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -33,6 +33,8 @@ import partitions
 LINUX_SRC = SRC / 'linux'
 FIRMWARE_DIR = BUILD / 'linux-firmware'
 PHY_FIRMWARE = FIRMWARE_DIR / 'rtl8261n.bin'
+# The kernel's name for it; the RTL8261CE driver requests it by this path.
+CE_FIRMWARE = FIRMWARE_DIR / 'rtl_nic/rtl8261c.bin'
 LOG = LOGS / 'linux.log'
 # OpenWrt's kernel patch series, applied in this order before ours.
 OPENWRT_PATCH_DIRS = ('target/linux/generic/backport-6.18',
@@ -93,10 +95,11 @@ def copy_project_files():
 def phy_firmware(openwrt):
     """rtl8261n.bin, the RTL8261N 10 GbE PHY patch, built into the kernel.
 
-    The Realtek PHY driver will not bind the two 10GBASE-T PHYs without it, and
-    it must be present at the first probe, before any root is mounted: a failed
-    probe leaves the PHY in reset. It is generated exactly as OpenWrt's
-    rtl826x-firmware package does, and the output is checked against its hash.
+    The W1700K's two 10GBASE-T PHYs are RTL8261Ns; the Realtek PHY driver will
+    not bind them without it, and it must be present at the first probe, before
+    any root is mounted: a failed probe leaves the PHY in reset. It is generated
+    exactly as OpenWrt's rtl826x-firmware package does, and the output is checked
+    against its hash.
     """
     pin = sources()['rtl8261n']
     if PHY_FIRMWARE.is_file() and sha256_file(PHY_FIRMWARE) == pin['output_sha256']:
@@ -128,6 +131,23 @@ def phy_firmware(openwrt):
                 'rtl8261n: the generated firmware does not match the pinned output')
         FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(generated, PHY_FIRMWARE)
+
+
+def ce_firmware():
+    """rtl_nic/rtl8261c.bin, the RTL8261CE's parameters, built into the kernel.
+
+    The W1700K2 (HW 2.1) has RTL8261CEs where the W1700K has RTL8261Ns, on the
+    same MDIO addresses, resets and inverted lanes; the driver is chosen by the
+    PHY's ID, so one kernel and one device tree serve both. The CE driver loads
+    this file when the PHY is first configured. Realtek's file from
+    linux-firmware, pinned by commit and checked against its hash.
+    """
+    pin = sources()['rtl8261c']
+    if CE_FIRMWARE.is_file() and sha256_file(CE_FIRMWARE) == pin['sha256']:
+        return
+    cached = fetch.download(pin['url'], pin['sha256'])
+    CE_FIRMWARE.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(cached, CE_FIRMWARE)
 
 
 def kernel_make(*targets):
@@ -170,6 +190,7 @@ def main():
             'no cross compiler; run platform/rootfs/build.py toolchain first')
     openwrt = prepare_source()
     phy_firmware(openwrt)
+    ce_firmware()
     configure()
     kernel_make('Image', 'modules')
     device_tree(openwrt)

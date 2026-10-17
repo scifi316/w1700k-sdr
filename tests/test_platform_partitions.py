@@ -36,25 +36,51 @@ class Layout(unittest.TestCase):
         self.assertNotIn('durable', partitions.READ_ONLY['linux'])
 
     def test_ubi_volumes_fit_with_the_bad_block_reserve(self):
-        # 20 per 1024 PEBs of the whole 4096-block chip, plus 4 for UBI itself.
-        self.assertEqual(partitions.UBI_BAD_RESERVE_PEBS, 80)
-        self.assertEqual(partitions.ubi_lebs('system'), 300)
-        self.assertEqual(partitions.DURABLE_LEBS, 172)
-        self.assertEqual(sum(lebs for _, _, lebs in partitions.SYSTEM_VOLUMES), 300)
-        self.assertEqual([name for name, _, _ in partitions.SYSTEM_VOLUMES],
-                         ['ubootenv', 'ubootenv2', 'fit', 'rootfs'])
+        # 20 per 1024 PEBs of the whole chip, plus 4 for UBI itself.
+        kv, lv = partitions.NANDS
+        self.assertEqual((partitions.ubi_bad_reserve(kv), partitions.ubi_bad_reserve(lv)),
+                         (80, 40))
+        self.assertEqual(partitions.ubi_lebs('system', kv), 300)
+        self.assertEqual(partitions.ubi_lebs('system', lv), 148)
+        self.assertEqual((partitions.durable_lebs(kv), partitions.durable_lebs(lv)), (172, 84))
+        for nand in partitions.NANDS:
+            volumes = partitions.system_volumes(nand)
+            self.assertEqual(sum(lebs for _, _, lebs in volumes),
+                             partitions.ubi_lebs('system', nand))
+            self.assertEqual([name for name, _, _ in volumes],
+                             ['ubootenv', 'ubootenv2', 'fit', 'rootfs'])
+            self.assertGreaterEqual(volumes[2][2] * nand.leb, partitions.FIT_VOLUME_BYTES)
+            self.assertGreaterEqual(volumes[3][2] * nand.leb, partitions.ROOTFS_VOLUME_BYTES)
         self.assertGreater(partitions.FIT_VOLUME_BYTES, 12 << 20)
         self.assertGreater(partitions.ROOTFS_VOLUME_BYTES, 16 << 20)
 
-    def test_the_bmt_may_write_only_project_partitions(self):
+    def test_the_parts(self):
+        kv, lv = partitions.NANDS
+        self.assertEqual((kv.name, kv.id, kv.blocks, kv.leb), ('W25N04KV', b'\xef\xaa\x23',
+                                                               4096, 0x1f000))
+        self.assertEqual((lv.name, lv.id, lv.blocks, lv.leb), ('W25N04LV', b'\xef\x8b\x23',
+                                                               2048, 0x3e000))
+        self.assertTrue(kv.tested)
+        self.assertFalse(lv.tested)
+        self.assertEqual(partitions.nand_by_id(b'\xef\x8b\x23'), lv)
+        self.assertIsNone(partitions.nand_by_id(b'\xef\xab\x23'))
+        self.assertEqual(partitions.nand_by_geometry(0x800, 0x20000, 128), kv)
+        # Every boundary lands on a 256 KiB block, and the layout ends inside
+        # the vendor's usable area of both parts at their worst.
+        self.assertEqual(partitions.ALIGNMENT, 0x40000)
+        self.assertEqual((partitions.least_usable(kv), partitions.least_usable(lv)), (3806, 1845))
+
+    def test_the_bmt_write_policy(self):
         header = partitions.policy_header()
-        first = partitions.GEOMETRY['system'][0] // partitions.BLOCK_BYTES
-        end = sum(partitions.GEOMETRY['scratch']) // partitions.BLOCK_BYTES
-        self.assertIn(f'#define BMT_WRITE_FIRST {first}u', header)
-        self.assertIn(f'#define BMT_WRITE_END {end}u', header)
-        self.assertIn('#define BMT_JOURNAL_BLOCK 3847u', header)
-        reserve = partitions.GEOMETRY['reserved-bmt'][0] // partitions.BLOCK_BYTES
-        self.assertGreaterEqual(partitions.JOURNAL_PHYSICAL_BLOCK, reserve)
+        first = partitions.GEOMETRY['system'][0]
+        end = sum(partitions.GEOMETRY['scratch'])
+        self.assertIn(f'#define BMT_WRITE_FIRST_BYTES {first:#x}ull', header)
+        self.assertIn(f'#define BMT_WRITE_END_BYTES {end:#x}ull', header)
+        self.assertIn('#define BMT_MIN_BLOCK_BYTES 0x20000u', header)
+        # The journal is the block after the BBT: 3847 on the W25N04KV.
+        self.assertIn('#define BMT_JOURNAL_AFTER_BBT 1u', header)
+        self.assertIn(f'#define BMT_WRITE_FIRST_BYTES {0x200000:#x}ull',
+                      partitions.policy_header('uenv'))
 
 
 class DeviceTrees(unittest.TestCase):

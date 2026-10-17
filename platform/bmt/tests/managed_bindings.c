@@ -6,6 +6,7 @@
 #include <string.h>
 int fail_alloc;
 #include LAYER_FILE
+#include "geometry.h"
 #ifdef TEST_LINUX
 #define attach sdr_bmt_attach
 #define detach sdr_bmt_detach
@@ -16,10 +17,10 @@ int fail_alloc;
 #define TRANSACTION_MODEL
 #include "publication.c"
 
-#define BS 131072u
-#define PS 2048u
+#define BS T_BS
+#define PS T_PS
 static struct mtd_info m;
-static unsigned char data[2*BS], oob[128*128], expected_data[2*BS], expected_oob[128*128];
+static unsigned char data[2*BS], oob[2*T_PAGES*T_OS], expected_data[2*BS], expected_oob[2*T_PAGES*T_OS];
 static unsigned mutations, physical_reads;
 static int fail_original, fail_erase_original, fail_metadata, fail_read_ecc, fail_marker, timeout_next;
 static int reenter, reentered;
@@ -33,12 +34,12 @@ static _Thread_local int reader_role;
 
 static unsigned auto_column(unsigned c) { return (c/14)*16+2+c%14; }
 static unsigned physical(unsigned logical)
-{ unsigned b=logical+(logical>=65 && logical<3845); return b==67 ? 3850 : b; }
+{ unsigned b=logical+(logical>=65 && logical<(T_SYSTEM-1)); return b==67 ? (T_SYSTEM+4) : b; }
 static unsigned char pattern(unsigned b,unsigned p,unsigned c) { return (b*3+p*13+c*7)%251; }
 
 static int driver_read(struct mtd_info *dev,loff_t from,struct mtd_oob_ops *ops)
 {
-	unsigned per=ops->mode==MTD_OPS_AUTO_OOB ? 56 : 128;
+	unsigned per=ops->mode==MTD_OPS_AUTO_OOB ? T_FREE : T_OS;
 	unsigned b=(u64)from/BS;
 	(void)dev; physical_reads++;
 	ops->retlen=ops->oobretlen=0;
@@ -52,8 +53,8 @@ static int driver_read(struct mtd_info *dev,loff_t from,struct mtd_oob_ops *ops)
 		u64 page=(u64)from/PS+(i+ops->ooboffs)/per;
 		unsigned col=(i+ops->ooboffs)%per;
 		if(ops->mode==MTD_OPS_AUTO_OOB) col=auto_column(col);
-		struct block *s=nand[page/64];
-		ops->oobbuf[i]=s ? s->spare[page%64][col] : 255;
+		struct block *s=nand[page/T_PAGES];
+		ops->oobbuf[i]=s ? s->spare[page%T_PAGES][col] : 255;
 	}
 	ops->retlen=ops->len;ops->oobretlen=ops->ooblen;
 	if(fail_read_ecc && b==original_physical && ops->mode!=MTD_OPS_RAW) return -EBADMSG;
@@ -61,11 +62,11 @@ static int driver_read(struct mtd_info *dev,loff_t from,struct mtd_oob_ops *ops)
 }
 static int driver_write(struct mtd_info *dev,loff_t to,struct mtd_oob_ops *ops)
 {
-	unsigned b=(u64)to/BS,p=((u64)to%BS)/PS,per=ops->mode==MTD_OPS_AUTO_OOB ? 56 : 128;
+	unsigned b=(u64)to/BS,p=((u64)to%BS)/PS,per=ops->mode==MTD_OPS_AUTO_OOB ? T_FREE : T_OS;
 	struct block *s=storage(b);
-	unsigned char main_page[2048], spare[128];
+	unsigned char main_page[T_PS], spare[T_OS];
 	(void)dev;
-	assert(b>=64 && b!=65 && b!=3846); /* physical protected/factory storage */
+	assert(b>=64 && b!=65 && b!=T_SYSTEM); /* physical protected/factory storage */
 	assert(!((u64)to%PS) && ops->len<=PS && ops->ooboffs+ops->ooblen<=per);
 	ops->retlen=ops->oobretlen=0; mutations++;
 #ifndef TEST_LINUX
@@ -92,13 +93,13 @@ static int driver_write(struct mtd_info *dev,loff_t to,struct mtd_oob_ops *ops)
 	}
 	int error=(fail_original && b==original_physical && ops->len);
 	if(error) fail_original=0;
-	unsigned bytes=error ? 1024 : 2048;
+	unsigned bytes=error ? (T_PS/2) : T_PS;
 	for(unsigned i=0;i<bytes;i++) {
 		if(i<ops->len) assert((s->main[p][i]&main_page[i])==main_page[i]);
 		s->main[p][i]&=main_page[i];
 	}
-	for(unsigned i=0;i<128;i++) s->spare[p][i]&=spare[i];
-	if(ops->mode!=MTD_OPS_RAW) s->spare[p][127]=0;
+	for(unsigned i=0;i<T_OS;i++) s->spare[p][i]&=spare[i];
+	if(ops->mode!=MTD_OPS_RAW) s->spare[p][T_OS-1]=0;
 	ops->retlen=ops->len<bytes ? ops->len : bytes;
 	ops->oobretlen=ops->ooblen;
 	return error ? -EIO : 0;
@@ -106,11 +107,11 @@ static int driver_write(struct mtd_info *dev,loff_t to,struct mtd_oob_ops *ops)
 static int driver_erase(struct mtd_info *dev,struct erase_info *e)
 {
 	unsigned b=e->addr/BS; (void)dev;
-	assert(e->addr%BS==0 && e->len==BS && b>=64 && b!=65 && b!=3846 && b!=4095);
+	assert(e->addr%BS==0 && e->len==BS && b>=64 && b!=65 && b!=T_SYSTEM && b!=T_LAST);
 	mutations++;
 	if(fail_erase_original && b==original_physical) { fail_erase_original=0;return -EIO; }
-	if(fail_metadata && b==4094) return -EIO;
-	struct block *s=storage(b);memset(s,255,sizeof *s);memset(s->programs,0,64);s->last=-1;
+	if(fail_metadata && b==(T_LAST-1)) return -EIO;
+	struct block *s=storage(b);memset(s,255,sizeof *s);memset(s->programs,0,T_PAGES);s->last=-1;
 	return 0;
 }
 static int driver_isbad(struct mtd_info *dev,loff_t from)
@@ -120,30 +121,35 @@ static int driver_markbad(struct mtd_info *dev,loff_t from)
 static void raw_mtd(void)
 {
 	memset(&m,0,sizeof m);m.size=0x20000000ULL;m.erasesize=BS;m.writesize=PS;
-	m.oobsize=128;m.oobavail=56;m.flags=MTD_WRITEABLE;
+	m.oobsize=T_OS;m.oobavail=T_FREE;m.flags=MTD_WRITEABLE;
 	m._read_oob=driver_read;m._write_oob=driver_write;m._erase=driver_erase;
 	m._block_isbad=driver_isbad;m._block_markbad=driver_markbad;
 }
 static void base(int populated)
 {
 	detach(&m);
-	for(unsigned b=0;b<4096;b++) { free(nand[b]);nand[b]=NULL; }
+	for(unsigned b=0;b<T_TOTAL;b++) { free(nand[b]);nand[b]=NULL; }
 	raw_mtd();fail_alloc=fail_original=fail_erase_original=fail_metadata=fail_read_ecc=fail_marker=timeout_next=0;
 	reenter=reentered=0;bmt_transport_failed=0;
 	original_physical=64;
-	assert(!airoha_bmt_set_geometry(&t,4096));t.bbt_loaded=t.bmt_loaded=t.bbt_ascending=1;
-	t.bbt_size=1;t.bbt_entries[0]=65;t.bmt_size=1;t.bmt_from[0]=67;t.bmt_to[0]=3850;
+	assert(!airoha_bmt_set_geometry(&t,T_TOTAL,T_POOL) && !airoha_bmt_set_pages(&t,T_PS,T_FREE));t.bbt_loaded=t.bmt_loaded=t.bbt_ascending=1;
+	t.bbt_size=1;t.bbt_entries[0]=65;t.bmt_size=1;t.bmt_from[0]=67;t.bmt_to[0]=(T_SYSTEM+4);
 	original=t;
-	assert(!airoha_bbt_encode(&t,storage(3846)->main[0],2048));storage(3846)->programs[0]=1;storage(3846)->last=0;
-	assert(!airoha_bmt_encode(&t,storage(4095)->main[0],2048));storage(4095)->programs[0]=1;storage(4095)->last=0;
+	assert(!airoha_bbt_encode(&t,storage(T_SYSTEM)->main[0],T_PS));storage(T_SYSTEM)->programs[0]=1;storage(T_SYSTEM)->last=0;
+	assert(!airoha_bmt_encode(&t,storage(T_LAST)->main[0],T_PS));storage(T_LAST)->programs[0]=1;storage(T_LAST)->last=0;
 	storage(65)->spare[0][0]=0;
+	/* The LV's pool comes from the vendor scan: two factory-bad blocks in its
+	 * span make it 165, which the tables below assume. */
+	if(T_FACTORY_TOP(T_FACTORY_TOP_A)) {
+		storage(T_FACTORY_TOP_A)->spare[0][0]=0; storage(T_FACTORY_TOP_B)->spare[0][0]=0;
+	}
 	if(populated) for(unsigned logical=64;logical<69;logical++) {
 		unsigned b=physical(logical);struct block *s=storage(b);
-		for(unsigned p=0;p<64;p++) {
-			for(unsigned i=0;i<2048;i++) s->main[p][i]=pattern(b,p,i);
-			for(unsigned i=0;i<128;i++) s->spare[p][i]=pattern(b,p,2048+i);
+		for(unsigned p=0;p<T_PAGES;p++) {
+			for(unsigned i=0;i<T_PS;i++) s->main[p][i]=pattern(b,p,i);
+			for(unsigned i=0;i<T_OS;i++) s->spare[p][i]=pattern(b,p,T_PS+i);
 			s->spare[p][0]=s->spare[p][1]=255;
-			s->spare[p][2]=b>=3846 ? 67 : 255;s->spare[p][3]=b>=3846 ? 0 : 255;
+			s->spare[p][2]=b>=T_SYSTEM ? 67 : 255;s->spare[p][3]=b>=T_SYSTEM ? 0 : 255;
 			s->programs[p]=1;s->last=p;
 		}
 	}
@@ -157,14 +163,14 @@ static void read_matrix(void)
 	base(1);
 	for(unsigned mode=0;mode<3;mode++) for(unsigned logical=64;logical<=66;logical++)
 	for(unsigned start=0;start<3;start++) for(unsigned kind=0;kind<5;kind++) {
-		unsigned per=mode==MTD_OPS_AUTO_OOB ? 56 : 128, off=11;
+		unsigned per=mode==MTD_OPS_AUTO_OOB ? T_FREE : T_OS, off=11;
 		u64 addr=(u64)logical*BS+BS-PS*(start+1)+17;
 		size_t len=kind==0 ? 0 : (kind==3 ? 23 : BS+PS*2);
-		size_t olen=kind==1 ? 0 : (kind==4 ? 9 : per*(64+4)-11);
+		size_t olen=kind==1 ? 0 : (kind==4 ? 9 : per*(T_PAGES+4)-11);
 		for(size_t i=0;i<len;i++) { u64 a=addr+i;unsigned b=physical(a/BS);expected_data[i]=storage(b)->main[(a%BS)/PS][a%PS]; }
 		for(size_t i=0;i<olen;i++) { u64 page=addr/PS+(i+off)/per;unsigned col=(i+off)%per;
 			if(mode==MTD_OPS_AUTO_OOB) col=auto_column(col);
-			expected_oob[i]=storage(physical(page/64))->spare[page%64][col]; }
+			expected_oob[i]=storage(physical(page/T_PAGES))->spare[page%T_PAGES][col]; }
 		struct mtd_oob_ops op={.mode=mode,.len=len,.ooblen=olen,.ooboffs=off,
 			.datbuf=len ? data : NULL,.oobbuf=olen ? oob : NULL};
 		assert(!m._read_oob(&m,addr,&op) && op.retlen==len && op.oobretlen==olen);
@@ -204,13 +210,36 @@ static void writes(void)
 	       layer.counters.readback_completed==before_readbacks+3 &&
 	       !layer.counters.markbad_attempts && !layer.counters.markbad_completed);
 	assert(!layer.writer->remaps && storage(64)->main[0][0]==0x5c &&
-	       storage(64)->main[1][0]==0x5c && storage(3850)->main[0][0]==0x5c);
+	       storage(64)->main[1][0]==0x5c && storage(T_SYSTEM+4)->main[0][0]==0x5c);
 	/* The same erase-then-write rule covers on-demand scratch without WAL. */
 	struct erase_info scratch_erase={.addr=448ull*BS,.len=BS};
 	assert(!m._erase(&m,&scratch_erase));before_mutations=mutations;before_reads=physical_reads;
 	op=(struct mtd_oob_ops){.mode=MTD_OPS_AUTO_OOB,.len=PS,.datbuf=data};
 	assert(!m._write_oob(&m,448ull*BS,&op) && op.retlen==PS);
 	assert(mutations==before_mutations+1 && physical_reads==before_reads+1);
+	/* A block erased in an earlier boot (a UBI free PEB: an EC header in page
+	 * 0, the rest erased) is learned once, then appended to directly: one
+	 * program and one readback per page, no erase, no journal, no remap. */
+	base(0);
+	{
+		struct block *s=storage(physical(68));
+		memset(s->main[0],0x11,PS); s->programs[0]=1; s->last=0;
+	}
+	before_mutations=mutations;
+	u64 before_erases=layer.counters.erase_attempts;
+	before_readbacks=layer.counters.readback_attempts;
+	memset(data,0x6e,PS);
+	for(unsigned page=1;page<=3;page++) {
+		op=(struct mtd_oob_ops){.mode=MTD_OPS_AUTO_OOB,.len=PS,.datbuf=data};
+		assert(!m._write_oob(&m,68ull*BS+page*PS,&op) && op.retlen==PS);
+	}
+	assert(mutations==before_mutations+3 && layer.counters.erase_attempts==before_erases);
+	assert(layer.counters.readback_attempts==before_readbacks+T_PAGES+3);
+	assert(!layer.writer->remaps && storage(physical(68))->programs[0]==1);
+	for(unsigned page=1;page<=3;page++) assert(storage(physical(68))->main[page][7]==0x6e);
+	/* A page below the highest in use is not appended to: it is remapped. */
+	op=(struct mtd_oob_ops){.mode=MTD_OPS_AUTO_OOB,.len=PS,.datbuf=data};
+	assert(!m._write_oob(&m,68ull*BS,&op) && op.retlen==PS && layer.writer->remaps==1);
 	/* A failed direct program falls back to the durable remap path. */
 	base(0);fast_erase=(struct erase_info){.addr=64ull*BS,.len=BS};
 	assert(!m._erase(&m,&fast_erase));fail_original=1;
@@ -230,7 +259,7 @@ static void writes(void)
 	fail_original=1;
 	op=(struct mtd_oob_ops){.mode=MTD_OPS_AUTO_OOB,.len=PS,.datbuf=data};
 	assert(!m._write_oob(&m,64ull*BS+2*PS,&op) && op.retlen==PS);
-	assert(layer.writer->remaps==1 && airoha_bmt_translate(&layer.t,64)>=3846);
+	assert(layer.writer->remaps==1 && airoha_bmt_translate(&layer.t,64)>=(int)T_SYSTEM);
 	unsigned former=original_physical=airoha_bmt_translate(&layer.t,64);
 	fail_original=1;
 	assert(!m._write_oob(&m,64ull*BS+3*PS,&op) && op.retlen==PS);
@@ -248,7 +277,7 @@ static void writes(void)
 	base(0);memset(data,0x39,sizeof data);
 	op=(struct mtd_oob_ops){.mode=MTD_OPS_AUTO_OOB,.len=PS+31,.datbuf=data};
 	assert(!m._write_oob(&m,64ull*BS+BS-17,&op) && op.retlen==PS+31);
-	assert(storage(64)->main[63][2031]==0x39 && storage(66)->main[0][0]==0x39);
+	assert(storage(64)->main[63][T_PS-17]==0x39 && storage(66)->main[0][0]==0x39);
 	base(0);fail_erase_original=1;
 	struct erase_info erase={.addr=64ull*BS,.len=BS};
 	assert(!m._erase(&m,&erase) && layer.writer->remaps==1);
@@ -260,7 +289,7 @@ static void writes(void)
 static void refusals(void)
 {
 	base(0);unsigned prior=mutations;
-	for(unsigned b=0;b<4096;b++) if(b<64 || b>=3568) {
+	for(unsigned b=0;b<T_TOTAL;b++) if(b<T_FIRST || b>=T_END) {
 		struct mtd_oob_ops op={.mode=MTD_OPS_AUTO_OOB,.len=1,.datbuf=data};
 		struct erase_info e={.addr=(u64)b*BS,.len=BS};
 		assert(m._write_oob(&m,(u64)b*BS,&op)==-EROFS && !op.retlen);
@@ -273,7 +302,7 @@ static void refusals(void)
 	}
 	assert(m._block_markbad(&m,64ull*BS)==-EOPNOTSUPP && prior==mutations);
 	struct mtd_oob_ops op={.mode=MTD_OPS_AUTO_OOB,.len=2,.datbuf=data};
-	assert(m._write_oob(&m,3568ull*BS-1,&op)==-EROFS && !op.retlen);
+	assert(m._write_oob(&m,T_END*BS-1,&op)==-EROFS && !op.retlen);
 	fail_read_ecc=1;op.len=PS;
 	assert(m._read_oob(&m,64ull*BS,&op)==-EBADMSG && op.retlen==PS);
 	assert(m._write_oob(&m,64ull*BS,&op)==-EBADMSG && !op.retlen && prior==mutations);
@@ -285,9 +314,13 @@ static void refusals(void)
 }
 static void recovery(void)
 {
+	/* The direct program tears its page; the transaction then stages the
+	 * intended block and remaps, and here its metadata write fails too. The
+	 * caller is told nothing was made durable; recovery publishes it. */
 	base(0);memset(data,0x57,sizeof data);fail_original=fail_metadata=1;
 	struct mtd_oob_ops op={.mode=MTD_OPS_AUTO_OOB,.len=PS,.datbuf=data};
-	assert(m._write_oob(&m,64ull*BS,&op)==-EIO && op.retlen==1024 && layer.writer->failed);
+	assert(m._write_oob(&m,64ull*BS,&op)==-EIO && !op.retlen && layer.writer->failed);
+	assert(layer.writer->has_pending);
 	unsigned prior=mutations;
 	assert(m._write_oob(&m,64ull*BS,&op)==-EIO && !op.retlen && mutations==prior);
 	assert(m._read_oob(&m,64ull*BS,&op)==-EIO && !op.retlen);
@@ -356,6 +389,6 @@ int main(void)
 	ubi_consumers();
 #endif
 	detach(&m);
-	for(unsigned b=0;b<4096;b++) free(nand[b]);
+	for(unsigned b=0;b<T_TOTAL;b++) free(nand[b]);
 	return 0;
 }

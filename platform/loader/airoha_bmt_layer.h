@@ -13,6 +13,9 @@ struct mtd_info;
  * configured. Failure refuses probe/registration; never expose raw fallback. */
 int airoha_bmt_attach(struct mtd_info *mtd);
 
+/* Whether `mtd` is attached, i.e. addressed through the vendor tables. */
+int airoha_bmt_attached(const struct mtd_info *mtd);
+
 /* Restore the original ops. Safe to call when not attached. */
 void airoha_bmt_detach(struct mtd_info *mtd);
 

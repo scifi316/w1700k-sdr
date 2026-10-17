@@ -13,11 +13,14 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'init'), str(Path(__file__).resolve().parent)]
 from initkit import backup, config, install, layout, provision, session, update  # noqa: E402
+from initkit import nand as parts  # noqa: E402
+from initkit.config import partitions  # noqa: E402
 from initkit.console import StepFailed  # noqa: E402
 from initkit.log import RunLog  # noqa: E402
 import init_fake_unit as fake  # noqa: E402
 
-DUMP_BYTES = 0x420000 + 0x420000 // 0x800 * 128
+DUMP_BYTES = 0x420000
+KV, LV = partitions.NANDS
 
 
 class Bench(unittest.TestCase):
@@ -33,9 +36,13 @@ class Bench(unittest.TestCase):
         for name, marker, size in (('LOADER', 'loader', 0x33e44), ('DUMPER', 'dumper', 0x2b000),
                                    ('SYSTEM_FIT', 'system', 0x90000),
                                    ('RECOVERY_FIT', 'recovery', 0xa0000),
-                                   ('ROOTFS', 'hsqs', 0x30000), ('DURABLE', 'ubifs', 0x20000)):
+                                   ('ROOTFS', 'hsqs', 0x30000)):
             paths[name] = images / name.lower()
             paths[name].write_bytes(fake.fit(marker, size))
+        for nand in partitions.NANDS:
+            (images / nand.durable_image).write_bytes(fake.fit(f'ubifs-{nand.name}', 0x20000))
+        paths['IMAGES'] = images
+        paths['DURABLES'] = tuple(images / nand.durable_image for nand in partitions.NANDS)
         for patcher in (mock.patch.multiple(config, **paths),
                         mock.patch.object(backup, 'DUMP_BYTES', DUMP_BYTES),
                         mock.patch('builtins.print')):
@@ -101,8 +108,63 @@ class Install(Bench):
         self.assertEqual(unit.saved['bootcmd_orig'], fake.STOCK_BOOTCMD)
         self.assertEqual(unit.ubi['system']['fit'], config.SYSTEM_FIT.read_bytes())
         self.assertEqual(unit.ubi['system']['rootfs'], self.unit_root.read_bytes())
-        self.assertEqual(unit.ubi['durable']['durable'], config.DURABLE.read_bytes())
+        self.assertEqual(unit.ubi['durable']['durable'], config.durable(KV).read_bytes())
         self.assertEqual(unit.state, 'linux')
+
+    def test_an_untested_nand_stops_before_the_backup(self):
+        unit = self.make_unit(part=LV)
+        with self.assertRaises(StepFailed) as raised:
+            self.install()
+        message = str(raised.exception)
+        for line in ('UNTESTED NAND IC DETECTED!', 'PLEASE SEND RAW NAND DUMP TO MAINTAINERS.',
+                     'Restart with --i-dont-care-about-nand-corruption to continue at your '
+                     'own risk.', 'W25N04LV (ID ef 8b 23)', 'init/rawdump'):
+            self.assertIn(line, message)
+        self.assertFalse(any(line.startswith(('mtd read', 'md.b', 'tftpput', 'flash',
+                                              'saveenv', 'mtd erase', 'ubi '))
+                             for line in self.commands()))
+        self.assertEqual(unit.saved.get('bootcmd'), fake.STOCK_BOOTCMD)
+
+    def test_the_flag_installs_on_an_untested_nand_with_its_own_layout(self):
+        unit = self.make_unit(part=LV)
+        self.assertEqual(self.install(accept_untested=True), 0)
+        self.assertEqual(unit.ubi['durable']['durable'], config.durable(LV).read_bytes())
+        self.assertNotEqual(config.durable(LV).read_bytes(), config.durable(KV).read_bytes())
+        sizes = {name: int(size, 16) for name, size, *_ in unit.created['system']}
+        self.assertEqual(sizes['fit'], 64 * LV.leb)
+        self.assertEqual(sizes['rootfs'], 82 * LV.leb)
+        self.assertEqual(unit.state, 'linux')
+
+    def test_a_pool_stock_does_not_share_stops_the_flagged_install(self):
+        unit = self.make_unit(part=LV, stock_pool=165)
+        with self.assertRaisesRegex(StepFailed, 'pool of 165 blocks and ours computes 163'):
+            self.install(accept_untested=True)
+        self.assertFalse(any(line.startswith(('tftpput', 'flash', 'saveenv', 'mtd erase'))
+                             for line in self.commands()))
+        self.assertEqual(unit.saved.get('bootcmd'), fake.STOCK_BOOTCMD)
+
+    def test_a_unit_at_the_stock_prompt_is_reset_so_stock_reports_its_pool(self):
+        unit = self.make_unit()
+        unit.boot_stock()
+        unit.buffer = ''
+        self.install(backup_only=True)
+        self.assertEqual(self.commands()[:2], ['<ctrl-c>', 'reset'])
+
+    def test_a_backup_of_an_untested_nand_needs_no_flag(self):
+        self.make_unit(part=LV)
+        self.assertEqual(self.install(backup_only=True), 0)
+        self.assertTrue(any(line.startswith('tftpput') for line in self.commands()))
+        self.assertFalse(any(line.startswith(('flash ', 'saveenv', 'mtd erase', 'ubi '))
+                             for line in self.commands()))
+
+    def test_an_unsupported_nand_is_refused_even_with_the_flag(self):
+        other = partitions.Nand('MX35LF4GE4AD', bytes.fromhex('c23703'), 0x1000, 128,
+                                0x40000, tested=False)
+        self.make_unit(part=other)
+        with self.assertRaisesRegex(StepFailed, 'UNSUPPORTED NAND IC: ID c2 37 03'):
+            self.install(accept_untested=True)
+        self.assertFalse(any(line.startswith(('tftpput', 'flash', 'saveenv'))
+                             for line in self.commands()))
 
     def test_the_order_keeps_the_unit_recoverable(self):
         self.make_unit()
@@ -126,6 +188,30 @@ class Install(Bench):
         stock_writes = [line for line in self.commands('stock')
                         if line.startswith(('flash write', 'flash erase'))]
         self.assertTrue(all(' 0x600000 ' in line for line in stock_writes))
+
+    def test_a_chip_the_dumper_cannot_translate_stops_before_anything(self):
+        unit = self.make_unit(translation='none')
+        with self.assertRaisesRegex(StepFailed, 'bad-block tables'):
+            self.install()
+        self.assertFalse(any(line.startswith(('md.b', 'tftpput', 'flash', 'saveenv'))
+                             for line in self.commands()))
+        self.assertEqual(unit.saved.get('bootcmd'), fake.STOCK_BOOTCMD)
+
+    def test_the_backup_is_read_corrected_and_translated(self):
+        self.make_unit()
+        self.install()
+        reads = [line for line in self.commands('dumper') if line.startswith('mtd read')]
+        self.assertTrue(reads and all(line.startswith('mtd read.dontskipbad spi-nand0 ')
+                                      for line in reads), reads)
+        self.assertEqual(reads[-1].split()[4:], ['0', f'{DUMP_BYTES:#x}'])
+
+    def test_the_console_is_woken_with_ctrl_c_never_an_empty_line(self):
+        # An empty line at a U-Boot prompt repeats the previous command.
+        self.make_unit()
+        self.install()
+        lines = [line for _, line in self.unit.log]
+        self.assertEqual(lines[0], '<ctrl-c>')
+        self.assertNotIn('', lines)
 
     def test_an_existing_backup_is_kept(self):
         directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
@@ -195,6 +281,18 @@ class Flash(Bench):
         self.assertIn(f"setenv bootargs '{layout.recovery_bootargs()}'", self.commands())
         self.assertEqual(unit.state, 'linux')
 
+    def durable_for(self, nand):
+        unit = self.make_unit(installed=True, part=nand)
+        unit.state = 'loader'
+        self.flash(durable=True, boot=False)
+        self.assertEqual(unit.ubi['durable']['durable'], config.durable(nand).read_bytes())
+
+    def test_durable_storage_gets_the_w25n04kv_image(self):
+        self.durable_for(KV)
+
+    def test_durable_storage_gets_the_w25n04lv_image(self):
+        self.durable_for(LV)
+
     def test_an_uninstalled_unit_cannot_take_a_loader_update(self):
         unit = self.make_unit()
         unit.state = 'stock'
@@ -224,9 +322,12 @@ class Layout(unittest.TestCase):
         self.assertEqual(again[-1], 'saveenv')
 
     def test_volumes_are_created_in_id_order(self):
-        self.assertEqual(layout.create_system_volumes(), [
+        self.assertEqual(layout.create_system_volumes(KV), [
             'ubi create ubootenv 0x4000 d 0', 'ubi create ubootenv2 0x4000 d 1',
             f'ubi create fit {128 * 0x1f000:#x} s 2', f'ubi create rootfs {170 * 0x1f000:#x} s 3'])
+        self.assertEqual(layout.create_system_volumes(LV), [
+            'ubi create ubootenv 0x4000 d 0', 'ubi create ubootenv2 0x4000 d 1',
+            f'ubi create fit {64 * 0x3e000:#x} s 2', f'ubi create rootfs {82 * 0x3e000:#x} s 3'])
 
     def test_erase_steps_cover_the_partition_exactly(self):
         steps = layout.erase('system')
@@ -242,6 +343,41 @@ class Layout(unittest.TestCase):
         self.assertIn(f'iminfo {layout.LOAD:#x}', steps)
 
 
+class Parts(unittest.TestCase):
+    PROBE = 'spi-nand: {}, 512 MiB, {} KiB blocks of 64 x ({} + {}) bytes\n'
+
+    def test_the_probe_line_names_the_part(self):
+        for nand in partitions.NANDS:
+            text = self.PROBE.format(nand.id.hex(' '), nand.block >> 10, nand.page, nand.oob)
+            self.assertEqual(parts.identify(text + '* spi-nand0\n'), nand)
+
+    def test_without_a_probe_line_the_geometry_decides(self):
+        text = '  - block size: 0x40000 bytes\n  - min I/O: 0x1000 bytes\n  - OOB size: 256 bytes\n'
+        self.assertEqual(parts.identify(text), LV)
+
+    def test_a_probe_line_that_contradicts_the_part_is_refused(self):
+        text = self.PROBE.format('ef aa 23', 256, 4096, 256)
+        with self.assertRaisesRegex(StepFailed, 'not its own geometry'):
+            parts.identify(text)
+
+    def test_no_part_at_all_is_refused(self):
+        with self.assertRaisesRegex(StepFailed, 'no SPI-NAND part'):
+            parts.identify('* spi-nand0\n')
+
+    def test_the_flag_turns_the_stop_into_a_warning(self):
+        parts.require_tested(KV, False)
+        with self.assertRaisesRegex(StepFailed, 'UNTESTED NAND IC DETECTED!'):
+            parts.require_tested(LV, False)
+        with mock.patch('builtins.print') as printed:
+            parts.require_tested(LV, True)
+        self.assertIn(parts.UNTESTED_FLAG, printed.call_args.args[0])
+
+    def test_install_and_restore_offer_the_flag(self):
+        for tool in ('install', 'restore'):
+            self.assertIn('nand.UNTESTED_FLAG', (ROOT / 'init' / tool).read_text())
+        self.assertEqual(parts.UNTESTED_FLAG, '--i-dont-care-about-nand-corruption')
+
+
 class Parsing(unittest.TestCase):
     def test_md_output_round_trips(self):
         text = '88000000: 73 65 72 69 61 6c  serial\n88000006: ff ff  ..\n'
@@ -254,10 +390,12 @@ class Parsing(unittest.TestCase):
         with self.assertRaisesRegex(StepFailed, 'no usable serial'):
             backup.serial_from({'serial_number': '../x'})
 
-    def test_geometry_gives_the_dump_size(self):
-        listing = ('  - min I/O: 0x800 bytes\n  - OOB size: 128 bytes\n'
-                   '  - 0x000000000000-0x000020000000 : "spi-nand0"')
-        self.assertEqual(backup.geometry(listing)['dump_bytes'], 0x22000000)
+    def test_only_a_translated_chip_is_backed_up(self):
+        with self.assertRaisesRegex(StepFailed, 'bad-block tables'):
+            backup.check_translated('  - translation: none')
+        with self.assertRaisesRegex(StepFailed, 'bad-block tables'):
+            backup.check_translated('  - flags: 0x0 (read-only)')
+        backup.check_translated('  - translation: vendor BBT/BMT')
 
     def test_a_writable_chip_is_refused(self):
         with self.assertRaisesRegex(StepFailed, 'read-only'):
@@ -269,7 +407,8 @@ class Prompts(unittest.TestCase):
     def test_console_prompts_match_the_u_boot_configurations(self):
         from initkit import uart
         for state, defconfig in (('loader', 'loader/an7581_w1700k_sdr_defconfig'),
-                                 ('dumper', 'dumper/an7581_w1700k_dumper_defconfig')):
+                                 ('dumper', 'dumper/an7581_w1700k_dumper_defconfig'),
+                                 ('restorer', 'restorer/an7581_w1700k_restorer_defconfig')):
             text = (ROOT / 'platform' / defconfig).read_text()
             prompt = re.search(r'^CONFIG_SYS_PROMPT="(.*)"$', text, re.M).group(1)
             self.assertTrue(uart.PROMPTS[state].search(b'\n' + prompt.encode()), state)

@@ -68,16 +68,24 @@ static int map_block(u32 block)
 	return mapped < 0 ? -EIO : mapped;
 }
 
-/* Read both physical marker bytes directly. The generic NAND bool/cache
- * interface can conceal read errors and is not a publication oracle. */
-static int raw_marker_bad(struct mtd_info *mtd, loff_t physical)
+/* Read both physical marker bytes directly; byte 1 (worn) counts if `worn`.
+ * The generic NAND bool/cache interface can conceal read errors and is not a
+ * publication oracle. */
+static int raw_marker_bad(struct mtd_info *mtd, loff_t physical, int worn)
 {
 	u8 markers[2];
 	struct mtd_oob_ops op={.mode=MTD_OPS_RAW,.ooblen=2,.oobbuf=markers};
 	int rc=layer._read_oob(mtd,physical,&op);
 	if(rc<0) return rc;
 	if(op.oobretlen!=2) return -EIO;
-	return markers[0]!=255 || markers[1]!=255;
+	return markers[0]!=255 || (worn && markers[1]!=255);
+}
+
+/* The vendor pool scan's question: is this block's factory marker (OOB byte
+ * 0 of its first page) set? Byte 1 (worn) does not count. */
+static int factory_marker_bad(void *ctx, u32 block)
+{
+	return raw_marker_bad(ctx,(loff_t)block<<layer.blk_shift,0);
 }
 
 /* Data and OOB advance independently through the same NAND page iterator.
@@ -186,7 +194,7 @@ static int sdr_bmt_block_isbad(struct mtd_info *mtd, loff_t ofs)
 
 	if (mapped < 0)
 		return mapped;
-	return raw_marker_bad(mtd, (loff_t)mapped << layer.blk_shift);
+	return raw_marker_bad(mtd, (loff_t)mapped << layer.blk_shift, 1);
 }
 
 static int sdr_bmt_block_markbad(struct mtd_info *mtd, loff_t ofs)
@@ -215,7 +223,7 @@ static int find_table(struct mtd_info *mtd, u8 *page, int is_bbt)
 
 		/* The unwrapped driver checks physical factory/worn markers. Never
 		 * accept a retired but readable table, or an unreadable marker. */
-		ret = raw_marker_bad(mtd, (loff_t)block << layer.blk_shift);
+		ret = raw_marker_bad(mtd, (loff_t)block << layer.blk_shift, 1);
 		if (ret < 0)
 			return ret;
 		if (ret)
@@ -303,7 +311,7 @@ static int attach_unlocked(struct mtd_info *mtd)
 	u32 erasesize = mtd->erasesize;
 	u32 total;
 	u8 *page;
-	int ret;
+	int ret, pool;
 
 	if (layer.mtd)
 		return -ENOSPC;
@@ -327,7 +335,12 @@ static int attach_unlocked(struct mtd_info *mtd)
 	layer._block_isbad = mtd->_block_isbad;
 	layer._block_markbad = mtd->_block_markbad;
 
-	if (airoha_bmt_set_geometry(&layer.t, total))
+	/* The pool the stock boot computes from the same markers: fixed at 250
+	 * on the W25N04KV, scanned on the W25N04LV. */
+	pool = airoha_bmt_vendor_pool(total, factory_marker_bad, mtd);
+	if (pool == AIROHA_BMT_E_MARKER)
+		return -EIO;
+	if (pool < 0 || airoha_bmt_set_geometry(&layer.t, total, (u32)pool))
 		return -EINVAL;
 
 	page = kmalloc(mtd->writesize, GFP_KERNEL);
@@ -362,8 +375,9 @@ static int attach_unlocked(struct mtd_info *mtd)
 	mtd->_block_isbad=managed_isbad;
 	mtd->_block_markbad=managed_markbad;
 #endif
-	pr_info("attached (system_blocks=%u, bbt=%u, bmt=%u); markbad refused\n",
-		layer.t.system_blocks, layer.t.bbt_size, layer.t.bmt_size);
+	pr_info("attached (system_blocks=%u, pool=%u, bbt=%u, bmt=%u); markbad refused\n",
+		layer.t.system_blocks, airoha_bmt_pool_blocks(&layer.t), layer.t.bbt_size,
+		layer.t.bmt_size);
 	return 0;
 }
 

@@ -80,6 +80,8 @@ CONFIG_MTD=y
 CONFIG_DM_MTD=y
 CONFIG_MTD_SPI_NAND=y
 CONFIG_MTD_SPI_NAND_READ_ONLY=y
+# The vendor BBT/BMT translation, read side only.
+CONFIG_AIROHA_BMT=y
 # CONFIG_MTD_UBI is not set
 # CONFIG_UBI_BLOCK is not set
 CONFIG_SPI=y

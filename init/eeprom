@@ -25,7 +25,7 @@ def main():
     parser.add_argument('--unit', metavar='SERIAL', required=True)
     parser.add_argument('--data-dir', type=Path, default=Path(settings['data_dir']))
     parser.add_argument('--backup', metavar='FILE', type=Path,
-                        help='a raw NAND backup (default: the one in the unit directory)')
+                        help='a NAND backup (default: the one in the unit directory)')
     args = parser.parse_args()
     if not backup.SERIAL_FORM.match(args.unit):
         parser.error('--unit must be the unit serial')

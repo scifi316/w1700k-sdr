@@ -1,0 +1,27 @@
+SPDX-License-Identifier: GPL-2.0+
+Subject: [PATCH] mtd: spinand: show a chip whose vendor tables do not validate, untranslated, in a read-only image
+
+The dumper reads through the vendor BBT/BMT translation, so a backup holds the
+data as stock firmware addresses it. A chip whose tables do not validate (an
+unknown part, or tables this project does not parse) would otherwise not probe
+at all, and nothing could be read from it to find out why. In an image built
+with CONFIG_MTD_SPI_NAND_READ_ONLY, keep such a chip untranslated: no write path
+exists, and `mtd list` reports the view. Every other image still refuses it.
+
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -1764,6 +1764,14 @@
+ 
+ #if IS_ENABLED(CONFIG_AIROHA_BMT)
+ 	ret = airoha_bmt_attach(mtd);
++	/* A read-only image may still show a chip whose tables do not validate,
++	 * untranslated: nothing can be written through it, and `mtd list` says
++	 * which view it is. Any other image refuses the chip. */
++	if (ret && IS_ENABLED(CONFIG_MTD_SPI_NAND_READ_ONLY)) {
++		printf("airoha-bmt: the vendor tables did not validate (%d); "
++		       "the chip stays untranslated\n", ret);
++		ret = 0;
++	}
+ 	if (ret)
+ 		goto err_spinand_cleanup;
+ #endif

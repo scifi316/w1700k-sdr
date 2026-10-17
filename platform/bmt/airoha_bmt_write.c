@@ -15,21 +15,27 @@ static airoha_u32 rd16(const airoha_u8 *p) { return p[0] | (p[1] << 8); }
 static airoha_u32 rd32(const airoha_u8 *p)
 { return rd16(p) | (rd16(p + 2) << 16); }
 
-static int was_free(const struct airoha_bmt_intent *r, airoha_u32 physical)
+static int in_pool(const struct airoha_bmt *t, airoha_u32 physical)
+{
+	return physical >= t->system_blocks && physical < t->total_blocks;
+}
+
+static int was_free(const struct airoha_bmt_intent *r, const struct airoha_bmt *t,
+		airoha_u32 physical)
 {
 	airoha_u32 index;
-	if (physical < 3846 || physical >= 4096)
+	if (!in_pool(t, physical))
 		return 0;
-	index = physical - 3846;
+	index = physical - t->system_blocks;
 	return (r->free_pool[index / 8] >> (index % 8)) & 1;
 }
 
 static int valid_map(const struct airoha_bmt *t)
 {
-	airoha_u32 i, j;
+	airoha_u32 i, j, pool = airoha_bmt_pool_blocks(t);
 	if (!t->geometry_set || !t->bbt_loaded || !t->bmt_loaded ||
-	    t->total_blocks != 4096 || t->system_blocks != 3846 ||
-	    !t->bbt_ascending || t->bbt_size > 250 || t->bmt_size > 250)
+	    !t->page_bytes || !t->oob_bytes || !pool || pool > AIROHA_BMT_MAX_ENTRIES ||
+	    !t->bbt_ascending || t->bbt_size > AIROHA_BMT_MAX_ENTRIES || t->bmt_size > pool)
 		return -EINVAL;
 	for (i = 0; i < t->bbt_size; i++)
 		if (t->bbt_entries[i] >= t->system_blocks ||
@@ -70,19 +76,20 @@ int airoha_bmt_write_validate(const struct airoha_bmt *t, airoha_u32 first,
 int airoha_bmt_encode(const struct airoha_bmt *t, airoha_u8 *page, airoha_u32 len)
 {
 	airoha_u32 i, sum;
-	if (len < AIROHA_WRITE_PAGE || valid_map(t))
+	if (valid_map(t) || len < t->page_bytes)
 		return -EINVAL;
-	memset(page, 0xff, AIROHA_WRITE_PAGE);
+	memset(page, 0xff, t->page_bytes);
 	memcpy(page, "BMT", 3);
 	page[3] = 1;
 	page[5] = t->bmt_size;
-	memset(page + AIROHA_BMT_HEADER, 0, 1000);
+	memset(page + AIROHA_BMT_HEADER, 0, 4 * AIROHA_BMT_MAX_ENTRIES);
 	for (i = 0; i < t->bmt_size; i++) {
 		wr16(page + AIROHA_BMT_HEADER + 4 * i, t->bmt_from[i]);
 		wr16(page + AIROHA_BMT_HEADER + 4 * i + 2, t->bmt_to[i]);
 	}
+	/* The vendor sums the pool's entries; past them the table is zero. */
 	sum = 1 + t->bmt_size;
-	for (i = AIROHA_BMT_HEADER; i < AIROHA_BMT_BYTES; i++)
+	for (i = AIROHA_BMT_HEADER; i < AIROHA_BMT_HEADER + 4 * airoha_bmt_pool_blocks(t); i++)
 		sum += page[i];
 	page[6] = sum;
 	return 0;
@@ -91,9 +98,9 @@ int airoha_bmt_encode(const struct airoha_bmt *t, airoha_u8 *page, airoha_u32 le
 int airoha_bbt_encode(const struct airoha_bmt *t, airoha_u8 *page, airoha_u32 len)
 {
 	airoha_u32 i, sum;
-	if (len < AIROHA_WRITE_PAGE || valid_map(t))
+	if (valid_map(t) || len < t->page_bytes)
 		return -EINVAL;
-	memset(page, 0xff, AIROHA_WRITE_PAGE);
+	memset(page, 0xff, t->page_bytes);
 	memcpy(page, "RAWB", 4);
 	page[8] = 1;
 	page[9] = t->bbt_size;
@@ -129,7 +136,7 @@ int airoha_bmt_replace(struct airoha_bmt *t, airoha_u32 logical, airoha_u32 cand
 	 * reserve self-entry quarantining the old destination. Stock translation
 	 * ignores reserve sources, but its allocator excludes EVERY destination.
 	 * Retirement therefore does not depend on erasing/programming a dead block. */
-	if (t->bmt_size == 250)
+	if (t->bmt_size >= airoha_bmt_pool_blocks(t))
 		return -ENOSPC;
 	if (index == t->bmt_size) {
 		t->bmt_size++;
@@ -143,17 +150,19 @@ int airoha_bmt_replace(struct airoha_bmt *t, airoha_u32 logical, airoha_u32 cand
 	return 0;
 }
 
-static int valid_intent(const struct airoha_bmt_intent *r)
+static int valid_intent(const struct airoha_bmt_intent *r, const struct airoha_bmt *t)
 {
-	if ((r->operation != AIROHA_INTENT_PROGRAM && r->operation != AIROHA_INTENT_ERASE) ||
-	    r->bbt_size > 250 || r->bmt_size > 250 || r->old_mapping_present > 1 ||
-	    r->logical_block >= 3846 - r->bbt_size || r->system_key >= 3846 ||
+	airoha_u32 i, pool = airoha_bmt_pool_blocks(t);
+	if (!t->geometry_set || !t->page_bytes || !pool || pool > AIROHA_BMT_MAX_ENTRIES ||
+	    (r->operation != AIROHA_INTENT_PROGRAM && r->operation != AIROHA_INTENT_ERASE) ||
+	    r->bbt_size > AIROHA_BMT_MAX_ENTRIES || r->bmt_size > pool ||
+	    r->old_mapping_present > 1 ||
+	    r->logical_block + r->bbt_size >= t->system_blocks ||
+	    r->system_key >= t->system_blocks ||
 	    r->system_key < r->logical_block ||
 	    r->system_key - r->logical_block > r->bbt_size ||
-	    r->candidate_block < 3846 || r->candidate_block >= 4096 ||
-	    r->journal_block < 3846 || r->journal_block >= 4096 ||
-	    r->old_table_block < 3846 || r->old_table_block >= 4096 ||
-	    r->bbt_block < 3846 || r->bbt_block >= 4096 ||
+	    !in_pool(t, r->candidate_block) || !in_pool(t, r->journal_block) ||
+	    !in_pool(t, r->old_table_block) || !in_pool(t, r->bbt_block) ||
 	    r->candidate_block == r->journal_block ||
 	    r->candidate_block == r->old_table_block || r->candidate_block == r->bbt_block ||
 	    r->journal_block == r->old_table_block || r->journal_block == r->bbt_block ||
@@ -162,23 +171,27 @@ static int valid_intent(const struct airoha_bmt_intent *r)
 	    r->old_physical == r->old_table_block || r->old_physical == r->bbt_block)
 		return -EINVAL;
 	if (r->old_mapping_present)
-		if (r->old_physical < 3846 || r->old_physical >= 4096 || !r->bmt_size)
+		if (!in_pool(t, r->old_physical) || !r->bmt_size)
 			return -EINVAL;
 	if (!r->old_mapping_present && r->old_physical != r->system_key)
 		return -EINVAL;
-	if ((r->free_pool[31] & 0xfc) || !was_free(r, r->candidate_block) ||
-	    !was_free(r, r->journal_block) || was_free(r, r->old_table_block) ||
-	    was_free(r, r->bbt_block) || was_free(r, r->old_physical))
+	for (i = pool; i < 8 * sizeof(r->free_pool); i++)
+		if ((r->free_pool[i / 8] >> (i % 8)) & 1)
+			return -EINVAL;
+	if (!was_free(r, t, r->candidate_block) || !was_free(r, t, r->journal_block) ||
+	    was_free(r, t, r->old_table_block) || was_free(r, t, r->bbt_block) ||
+	    was_free(r, t, r->old_physical))
 		return -EINVAL;
 	return 0;
 }
 
 int airoha_bmt_intent_encode(const struct airoha_bmt_intent *r,
-		airoha_u8 *p, airoha_u32 len, airoha_sha256_fn hash)
+		const struct airoha_bmt *t, airoha_u8 *p, airoha_u32 len,
+		airoha_sha256_fn hash)
 {
-	if (len < AIROHA_WRITE_PAGE || !hash || valid_intent(r))
+	if (!hash || valid_intent(r, t) || len < t->page_bytes)
 		return -EINVAL;
-	memset(p, 0xff, AIROHA_WRITE_PAGE);
+	memset(p, 0xff, t->page_bytes);
 	memcpy(p, intent_magic, 8);
 	wr16(p + 8, 3);
 	wr16(p + 10, r->operation);
@@ -190,8 +203,8 @@ int airoha_bmt_intent_encode(const struct airoha_bmt_intent *r,
 	memcpy(p + 32, r->bmt_digest, 32);
 	memcpy(p + 64, r->bbt_digest, 32);
 	memcpy(p + 96, r->data_digest, 32);
-	wr32(p + 128, AIROHA_WRITE_BLOCK); wr32(p + 132, AIROHA_WRITE_PAGE);
-	wr32(p + 136, AIROHA_WRITE_OOB); wr32(p + 140, 4096);
+	wr32(p + 128, AIROHA_BMT_BLOCK_PAGES * t->page_bytes); wr32(p + 132, t->page_bytes);
+	wr32(p + 136, t->oob_bytes); wr32(p + 140, t->total_blocks);
 	memcpy(p + 144, r->free_pool, 32);
 	memcpy(p + 176, r->preimage_digest, 32);
 	hash(p, 208, p + 208);
@@ -199,17 +212,19 @@ int airoha_bmt_intent_encode(const struct airoha_bmt_intent *r,
 }
 
 int airoha_bmt_intent_decode(struct airoha_bmt_intent *r,
-		const airoha_u8 *p, airoha_u32 len, airoha_sha256_fn hash)
+		const struct airoha_bmt *t, const airoha_u8 *p, airoha_u32 len,
+		airoha_sha256_fn hash)
 {
 	struct airoha_bmt_intent decoded;
 	airoha_u8 digest[32];
 	airoha_u32 i;
-	if (len < AIROHA_WRITE_PAGE || !hash || memcmp(p, intent_magic, 8) ||
+	if (!hash || !t->page_bytes || len < t->page_bytes || memcmp(p, intent_magic, 8) ||
 	    rd16(p + 8) != 3 || p[31] != 0xff ||
-	    rd32(p + 128) != AIROHA_WRITE_BLOCK || rd32(p + 132) != AIROHA_WRITE_PAGE ||
-	    rd32(p + 136) != AIROHA_WRITE_OOB || rd32(p + 140) != 4096)
+	    rd32(p + 128) != AIROHA_BMT_BLOCK_PAGES * t->page_bytes ||
+	    rd32(p + 132) != t->page_bytes || rd32(p + 136) != t->oob_bytes ||
+	    rd32(p + 140) != t->total_blocks)
 		return -EINVAL;
-	for (i = AIROHA_INTENT_BYTES; i < AIROHA_WRITE_PAGE; i++)
+	for (i = AIROHA_INTENT_BYTES; i < t->page_bytes; i++)
 		if (p[i] != 0xff)
 			return -EINVAL;
 	hash(p, 208, digest);
@@ -227,7 +242,7 @@ int airoha_bmt_intent_decode(struct airoha_bmt_intent *r,
 	memcpy(decoded.data_digest, p + 96, 32);
 	memcpy(decoded.free_pool, p + 144, 32);
 	memcpy(decoded.preimage_digest, p + 176, 32);
-	if (valid_intent(&decoded))
+	if (valid_intent(&decoded, t))
 		return -EINVAL;
 	*r = decoded;
 	return 0;
@@ -240,12 +255,12 @@ int airoha_bmt_intent_match(const struct airoha_bmt_intent *r,
 	airoha_u8 digest[32];
 	airoha_u32 i, index;
 	int mapped, shift;
-	if (!hash || valid_intent(r) || valid_map(t) || r->bbt_size != t->bbt_size)
+	if (!hash || valid_map(t) || valid_intent(r, t) || r->bbt_size != t->bbt_size)
 		return -EINVAL;
 	shift = airoha_bmt_shift(t, r->logical_block);
 	if (shift < 0 || r->logical_block + shift != r->system_key)
 		return -EINVAL;
-	airoha_bbt_encode(t, page, AIROHA_WRITE_PAGE);
+	airoha_bbt_encode(t, page, t->page_bytes);
 	hash(page, AIROHA_BBT_BYTES, digest);
 	if (memcmp(digest, r->bbt_digest, 32))
 		return -EINVAL;
@@ -278,10 +293,10 @@ int airoha_bmt_intent_match(const struct airoha_bmt_intent *r,
 		}
 	}
 	if (scratch->bmt_size != r->bmt_size ||
-	    airoha_bmt_encode(scratch, page, AIROHA_WRITE_PAGE))
+	    airoha_bmt_encode(scratch, page, t->page_bytes))
 		return -EINVAL;
 	for (i = 0; i < scratch->bmt_size; i++)
-		if (was_free(r, scratch->bmt_to[i]))
+		if (was_free(r, t, scratch->bmt_to[i]))
 			return -EINVAL;
 	hash(page, AIROHA_BMT_BYTES, digest);
 	return memcmp(digest, r->bmt_digest, 32) ? -EINVAL : 0;
@@ -312,7 +327,7 @@ static int find_selected(struct airoha_bmt *t, const struct airoha_bmt_flash *io
 		rc = io->read_page(io->ctx, block, 0, page);
 		if (!readable(rc))
 			continue; /* stock also skips an unreadable table page */
-		if (!airoha_bmt_parse_bmt(t, page, AIROHA_WRITE_PAGE)) {
+		if (!airoha_bmt_parse_bmt(t, page, t->page_bytes)) {
 			*selected = block;
 			return 0;
 		}
@@ -336,8 +351,8 @@ static int discard_metadata(const struct airoha_bmt_flash *io, airoha_u32 block)
 }
 
 static int consume_ticket(const struct airoha_bmt_flash *io,
-		const struct airoha_bmt_intent *r, airoha_u32 new_table,
-		airoha_u8 *expected, airoha_u8 *actual)
+		const struct airoha_bmt_intent *r, airoha_u32 page_bytes,
+		airoha_u32 new_table, airoha_u8 *expected, airoha_u8 *actual)
 {
 	airoha_u32 page, used = 0;
 	int rc;
@@ -353,7 +368,7 @@ static int consume_ticket(const struct airoha_bmt_flash *io,
 	if (used == AIROHA_RETIRE_ATTEMPTS)
 		return -EIO;
 	page = used + 1;
-	memset(expected, 0xff, AIROHA_WRITE_PAGE);
+	memset(expected, 0xff, page_bytes);
 	memcpy(expected, "SDRTICK2", 8);
 	wr16(expected + 8, r->old_table_block);
 	wr16(expected + 10, new_table);
@@ -366,7 +381,7 @@ static int consume_ticket(const struct airoha_bmt_flash *io,
 	rc = io->read_page(io->ctx, r->journal_block, page, actual);
 	if (!readable(rc))
 		return rc;
-	return memcmp(expected, actual, AIROHA_WRITE_PAGE) ? -EIO : 0;
+	return memcmp(expected, actual, page_bytes) ? -EIO : 0;
 }
 
 int airoha_bmt_publish(struct airoha_bmt *t, struct airoha_bmt *scratch,
@@ -375,14 +390,15 @@ int airoha_bmt_publish(struct airoha_bmt *t, struct airoha_bmt *scratch,
 		airoha_u32 *selected_table)
 {
 	struct airoha_bmt other;
-	airoha_u32 selected, block, i, high_data, new_table = 0;
+	airoha_u32 selected, block, i, high_data, page_bytes, new_table = 0;
 	int rc;
 	if (!io || !io->hash || !io->read_page || !io->program_page || !io->erase ||
 	    !io->erased || !io->markers || !io->retire || !io->verify_image ||
-	    t == scratch || expected == actual || valid_map(t) || valid_intent(r) ||
+	    t == scratch || expected == actual || valid_map(t) || valid_intent(r, t) ||
 	    r->logical_block < first || r->logical_block >= end)
 		return -EINVAL;
-	rc = airoha_bmt_intent_encode(r, expected, AIROHA_WRITE_PAGE, io->hash);
+	page_bytes = t->page_bytes;
+	rc = airoha_bmt_intent_encode(r, t, expected, page_bytes, io->hash);
 	if (rc)
 		return rc;
 	rc = physical_bad(io, r->journal_block);
@@ -391,7 +407,7 @@ int airoha_bmt_publish(struct airoha_bmt *t, struct airoha_bmt *scratch,
 	rc = io->read_page(io->ctx, r->journal_block, 0, actual);
 	if (!readable(rc))
 		return rc;
-	if (memcmp(expected, actual, AIROHA_WRITE_PAGE))
+	if (memcmp(expected, actual, page_bytes))
 		return -EBADMSG; /* never publish from an undurable or different record */
 	rc = io->verify_image(io->ctx, r);
 	if (rc)
@@ -426,7 +442,7 @@ int airoha_bmt_publish(struct airoha_bmt *t, struct airoha_bmt *scratch,
 	rc = airoha_bmt_replace(scratch, r->logical_block, r->candidate_block);
 	if (rc)
 		return rc;
-	rc = airoha_bmt_encode(scratch, expected, AIROHA_WRITE_PAGE);
+	rc = airoha_bmt_encode(scratch, expected, page_bytes);
 	if (rc)
 		return rc;
 	/* The immutable free-pool snapshot is necessary on recovery: it identifies
@@ -441,18 +457,19 @@ int airoha_bmt_publish(struct airoha_bmt *t, struct airoha_bmt *scratch,
 		if (rc)
 			continue;
 		rc = io->read_page(io->ctx, block, 0, actual);
-		if (!was_free(r, block) || block == r->candidate_block || block == r->journal_block) {
+		if (!was_free(r, t, block) || block == r->candidate_block ||
+		    block == r->journal_block) {
 			/* Even a live data block can happen to look like a valid BMT.
 			 * Never descend below an unowned selector candidate and then
 			 * retire the higher old table: stock would select that candidate. */
 			if (!readable(rc))
 				return rc;
 			other = *t;
-			if (!airoha_bmt_parse_bmt(&other, actual, AIROHA_WRITE_PAGE))
+			if (!airoha_bmt_parse_bmt(&other, actual, page_bytes))
 				return -EUCLEAN;
 			continue;
 		}
-		if (readable(rc) && !memcmp(expected, actual, AIROHA_WRITE_PAGE)) {
+		if (readable(rc) && !memcmp(expected, actual, page_bytes)) {
 			new_table = block; /* a verified write interrupted before retirement */
 			break;
 		}
@@ -466,7 +483,7 @@ int airoha_bmt_publish(struct airoha_bmt *t, struct airoha_bmt *scratch,
 		rc = io->program_page(io->ctx, block, 0, expected);
 		if (!rc) {
 			rc = io->read_page(io->ctx, block, 0, actual);
-			if (readable(rc) && !memcmp(expected, actual, AIROHA_WRITE_PAGE)) {
+			if (readable(rc) && !memcmp(expected, actual, page_bytes)) {
 				new_table = block;
 				break;
 			}
@@ -477,7 +494,7 @@ int airoha_bmt_publish(struct airoha_bmt *t, struct airoha_bmt *scratch,
 	}
 	if (!new_table)
 		return -ENOSPC;
-	rc = consume_ticket(io, r, new_table, expected, actual);
+	rc = consume_ticket(io, r, page_bytes, new_table, expected, actual);
 	if (rc)
 		return rc;
 	/* Never call the vendor markbad helper: it erases the old table first. */

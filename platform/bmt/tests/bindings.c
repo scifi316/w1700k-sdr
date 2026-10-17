@@ -6,6 +6,7 @@
 #include <string.h>
 int fail_alloc;
 #include LAYER_FILE
+#include "geometry.h"
 #ifdef TEST_LINUX
 #define attach sdr_bmt_attach
 #define detach sdr_bmt_detach
@@ -13,15 +14,15 @@ int fail_alloc;
 #define attach airoha_bmt_attach
 #define detach airoha_bmt_detach
 #endif
-#define BS 131072u
-#define PS 2048u
-#define OS 128u
-#define SYS 3846u
+#define BS T_BS
+#define PS T_PS
+#define OS T_OS
+#define SYS T_SYSTEM
 static struct mtd_info m;
 static int scanning, missing, corrupt, stale, marker_error, short_scan;
 static int fault, partial, calls, mutation_calls, bad_queries;
 static unsigned char data[3*BS], oob[3*BS], expected_data[3*BS], expected_oob[3*BS];
-static unsigned char bbt[2048], new_bbt[2048], old_bmt[2048], new_bmt[2048];
+static unsigned char bbt[T_PS], new_bbt[T_PS], old_bmt[T_PS], new_bmt[T_PS];
 static void put16(unsigned char *p, unsigned v) { p[0]=v; p[1]=v>>8; }
 static void tables(void)
 {
@@ -34,9 +35,9 @@ static void tables(void)
  sum++;new_bbt[4]=sum;new_bbt[5]=sum>>8;
  memset(old_bmt,255,sizeof old_bmt); memcpy(old_bmt,"BMT",3);
  old_bmt[3]=1; old_bmt[5]=1; put16(old_bmt+20,7); put16(old_bmt+22,SYS+4);
- sum=2; for(unsigned i=20;i<1020;i++) sum+=old_bmt[i]; old_bmt[6]=sum;
+ sum=2; for(unsigned i=20;i<20+4*T_POOL;i++) sum+=old_bmt[i]; old_bmt[6]=sum;
  memcpy(new_bmt,old_bmt,sizeof new_bmt); put16(new_bmt+22,SYS+5);
- sum=2; for(unsigned i=20;i<1020;i++) sum+=new_bmt[i]; new_bmt[6]=sum;
+ sum=2; for(unsigned i=20;i<20+4*T_POOL;i++) sum+=new_bmt[i]; new_bmt[6]=sum;
 }
 static unsigned physical(unsigned logical)
 {
@@ -54,17 +55,20 @@ static int driver_io(struct mtd_info *dev,loff_t addr,struct mtd_oob_ops *ops,in
     !ops->ooboffs && !(addr%BS)) {
    bad_queries++;
    if(marker_error) return -EIO;
-   ops->oobbuf[0]=(addr/BS==5 || ((stale&1) && addr/BS==4095) ||
+   /* Factory-bad blocks clear byte 0; a retired table, like the engine's
+    * retirement, clears byte 1, which the vendor pool scan does not count. */
+   ops->oobbuf[0]=(addr/BS==5 || T_FACTORY_TOP(addr/BS)) ? 0 : 255;
+   ops->oobbuf[1]=(((stale&1) && addr/BS==T_LAST) ||
                   ((stale&2) && addr/BS==SYS)) ? 0 : 255;
-   ops->oobbuf[1]=255;ops->oobretlen=2;return 0;
+   ops->oobretlen=2;return 0;
  }
  if(scanning) {
    assert(!write); memset(ops->datbuf,255,ops->len);
    if(!missing && addr/BS==SYS) memcpy(ops->datbuf,bbt,ops->len);
-   if(!missing && addr/BS==4095) {
+   if(!missing && addr/BS==T_LAST) {
      memcpy(ops->datbuf,old_bmt,ops->len); if(corrupt) ops->datbuf[6]^=1;
    }
-   if((stale&1) && addr/BS==4094) memcpy(ops->datbuf,new_bmt,ops->len);
+   if((stale&1) && addr/BS==(T_LAST-1)) memcpy(ops->datbuf,new_bmt,ops->len);
    if((stale&2) && addr/BS==SYS+1) memcpy(ops->datbuf,new_bbt,ops->len);
    ops->retlen=short_scan ? 0 : ops->len; return 0;
  }
@@ -84,11 +88,11 @@ static int driver_read(struct mtd_info *d,loff_t a,struct mtd_oob_ops *o) { retu
 static int driver_write(struct mtd_info *d,loff_t a,struct mtd_oob_ops *o) { return driver_io(d,a,o,1); }
 static int driver_erase(struct mtd_info *d,struct erase_info *e) { (void)d;(void)e; mutation_calls++;return 0; }
 static int driver_bad(struct mtd_info *d,loff_t a)
-{ (void)d;bad_queries++; if(marker_error) return -EIO; return a/BS==5 || ((stale&1) && a/BS==4095) || ((stale&2) && a/BS==SYS); }
+{ (void)d;bad_queries++; if(marker_error) return -EIO; return a/BS==5 || T_FACTORY_TOP(a/BS) || ((stale&1) && a/BS==T_LAST) || ((stale&2) && a/BS==SYS); }
 static int driver_mark(struct mtd_info *d,loff_t a) { (void)d;(void)a;mutation_calls++;return 0; }
 static void init_mtd(struct mtd_info *d)
 {
- memset(d,0,sizeof *d); d->size=4096ull*BS; d->erasesize=BS;d->writesize=PS;
+ memset(d,0,sizeof *d); d->size=T_TOTAL*BS; d->erasesize=BS;d->writesize=PS;
  d->oobsize=OS;d->oobavail=32;d->flags=MTD_WRITEABLE;
  d->_read_oob=driver_read;d->_write_oob=driver_write;d->_erase=driver_erase;
  d->_block_isbad=driver_bad;d->_block_markbad=driver_mark;
@@ -108,14 +112,14 @@ static void transfers(void)
    unsigned per=mode==MTD_OPS_AUTO_OOB ? 32 : OS;
    loff_t addr=(loff_t)logical*BS+BS-PS*(start+1)+17;
    size_t len=kind==0 ? 0 : (kind==3 ? 23 : BS+PS*2);
-   size_t olen=kind==1 ? 0 : (kind==4 ? 9 : per*(64+4)-11);
+   size_t olen=kind==1 ? 0 : (kind==4 ? 9 : per*(T_PAGES+4)-11);
    unsigned off=11;
    for(size_t i=0;i<len;i++) {
      loff_t a=addr+i;expected_data[i]=tag((physical(a/BS)*BS+a%BS)/PS,a%PS);
    }
    for(size_t i=0;i<olen;i++) {
      unsigned page=addr/PS+(i+off)/per;
-     expected_oob[i]=tag(physical(page/64)*64+page%64,PS+(i+off)%per);
+     expected_oob[i]=tag(physical(page/T_PAGES)*T_PAGES+page%T_PAGES,PS+(i+off)%per);
    }
    for(int write=0;write<2;write++) {
      struct mtd_oob_ops op={.mode=mode,.len=len,.ooblen=olen,.ooboffs=off,

@@ -8,7 +8,7 @@ the run at once; every step can be repeated.
 from pathlib import Path
 import shutil
 
-from . import config, console as unit, layout, stock
+from . import config, console as unit, layout, nand as parts, stock
 from .console import StepFailed, command, verify_fit
 from .log import sha256_file
 
@@ -105,7 +105,14 @@ def detach(session):
     command(session.console, 'ubi detach', limit=60)
 
 
-def format_system(session, fit, rootfs):
+def loader_nand(session):
+    """At the loader: the NAND part, from `mtd list`."""
+    listing = session.console.must_run('mtd list', limit=30)
+    session.log.text('mtd-list.txt', listing)
+    return parts.identify(listing)
+
+
+def format_system(session, fit, rootfs, nand):
     """At the loader: erase `system`, create its volumes, write the FIT and root."""
     console = session.console
     console.expect_prompt('loader', timeout=10)
@@ -113,7 +120,7 @@ def format_system(session, fit, rootfs):
     for line in layout.erase('system'):
         command(console, line, limit=300, heartbeat=30)
     attach(session, 'system')
-    for line in layout.create_system_volumes():
+    for line in layout.create_system_volumes(nand):
         command(console, line, expect='Creating', limit=300)
     loader_network(session)
     write_volume(session, 'fit', fit, fit=True)
@@ -121,8 +128,8 @@ def format_system(session, fit, rootfs):
     detach(session)
 
 
-def format_durable(session):
-    """At the loader: erase `durable` and write an empty UBIFS volume to it."""
+def format_durable(session, nand):
+    """At the loader: erase `durable` and write the part's empty UBIFS volume to it."""
     console = session.console
     console.expect_prompt('loader', timeout=10)
     detach(session)
@@ -132,7 +139,7 @@ def format_durable(session):
     for line in layout.create_durable_volume():
         command(console, line, expect='Creating', limit=300)
     loader_network(session)
-    write_volume(session, 'durable', config.DURABLE)
+    write_volume(session, 'durable', config.durable(nand))
     detach(session)
 
 

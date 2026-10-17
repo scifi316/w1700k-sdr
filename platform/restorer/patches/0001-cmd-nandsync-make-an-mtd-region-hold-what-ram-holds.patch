@@ -1,0 +1,159 @@
+SPDX-License-Identifier: GPL-2.0+
+Subject: [PATCH] cmd: nandsync: make an MTD region hold what RAM holds, block by block
+
+The restorer holds a whole backup in RAM, most of which the unit already has.
+NAND writes are slow, so compare each eraseblock with RAM and erase, write and
+read back only one that differs (or cannot be read); `.check` only counts.
+
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1557,6 +1557,14 @@
+ 	help
+ 	  MTD commands support.
+ 
++config CMD_NANDSYNC
++	bool "nandsync"
++	depends on CMD_MTD
++	help
++	  Make an MTD region hold what RAM holds, one eraseblock at a time: each
++	  block is read and compared, and only one that differs is erased,
++	  written and read back.
++
+ config CMD_MTD_OTP
+ 	bool "mtd otp"
+ 	depends on CMD_MTD
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -124,6 +124,7 @@
+ obj-$(CONFIG_CMD_OPTEE) += optee.o
+ obj-$(CONFIG_CMD_MP) += mp.o
+ obj-$(CONFIG_CMD_MTD) += mtd.o
++obj-$(CONFIG_CMD_NANDSYNC) += nandsync.o
+ obj-$(CONFIG_CMD_MTDPARTS) += mtdparts.o
+ obj-$(CONFIG_CMD_CLONE) += clone.o
+ ifneq ($(CONFIG_CMD_NAND)$(CONFIG_CMD_SF),)
+--- /dev/null
++++ b/cmd/nandsync.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Make an MTD region hold what RAM holds, one eraseblock at a time.
++ *
++ * Each block is read (the ECC correcting it) and compared with RAM. Only a
++ * block that differs, or that cannot be read, is erased, written and read
++ * back; a block that already holds the data is not touched. `.check` only
++ * counts the blocks that differ.
++ */
++#include <command.h>
++#include <console.h>
++#include <malloc.h>
++#include <mapmem.h>
++#include <mtd.h>
++#include <vsprintf.h>
++#include <linux/errno.h>
++#include <linux/mtd/mtd.h>
++
++#define PROGRESS_BLOCKS	256
++
++/* 0 for good data (corrected or not), -EBADMSG for data the ECC could not
++ * correct, another error for a failed read. */
++static int read_block(struct mtd_info *mtd, u64 off, u8 *buf)
++{
++	size_t got = 0;
++	int ret = mtd_read(mtd, off, mtd->erasesize, &got, buf);
++
++	if (mtd_is_bitflip(ret))
++		ret = 0;
++	if (!ret && got != mtd->erasesize)
++		ret = -EIO;
++	return ret;
++}
++
++static int rewrite_block(struct mtd_info *mtd, u64 off, const u8 *want, u8 *buf)
++{
++	struct erase_info erase = {
++		.mtd = mtd, .addr = off, .len = mtd->erasesize,
++	};
++	size_t put = 0;
++	int ret = mtd_erase(mtd, &erase);
++
++	if (!ret)
++		ret = mtd_write(mtd, off, mtd->erasesize, &put, want);
++	if (!ret && put != mtd->erasesize)
++		ret = -EIO;
++	if (!ret)
++		ret = read_block(mtd, off, buf);
++	if (!ret && memcmp(buf, want, mtd->erasesize))
++		ret = -EIO;
++	return ret;
++}
++
++static int do_nandsync(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	bool check = strstr(argv[0], ".check");
++	u64 off, end, blocks = 0, differ = 0;
++	struct mtd_info *mtd;
++	ulong addr;
++	u8 *buf;
++	int ret = 0;
++
++	if (argc != 5)
++		return CMD_RET_USAGE;
++	mtd_probe_devices();
++	mtd = get_mtd_device_nm(argv[1]);
++	if (IS_ERR_OR_NULL(mtd)) {
++		printf("nandsync: no MTD device %s\n", argv[1]);
++		return CMD_RET_FAILURE;
++	}
++	addr = hextoul(argv[2], NULL);
++	off = simple_strtoull(argv[3], NULL, 16);
++	end = off + simple_strtoull(argv[4], NULL, 16);
++	if (end <= off || off % mtd->erasesize || end % mtd->erasesize ||
++	    end > mtd->size) {
++		printf("nandsync: the region is not whole blocks of %s\n", mtd->name);
++		put_mtd_device(mtd);
++		return CMD_RET_FAILURE;
++	}
++	buf = malloc(mtd->erasesize);
++	if (!buf) {
++		put_mtd_device(mtd);
++		return CMD_RET_FAILURE;
++	}
++
++	for (; off < end; off += mtd->erasesize, addr += mtd->erasesize) {
++		const u8 *want = map_sysmem(addr, mtd->erasesize);
++
++		if (ctrlc()) {
++			ret = -EINTR;
++		} else {
++			ret = read_block(mtd, off, buf);
++			if (ret == -EBADMSG || (!ret && memcmp(buf, want, mtd->erasesize))) {
++				differ++;
++				ret = check ? 0 : rewrite_block(mtd, off, want, buf);
++			}
++		}
++		unmap_sysmem(want);
++		if (ret) {
++			printf("nandsync: stopped at 0x%llx (%d)\n", off, ret);
++			break;
++		}
++		if (++blocks % PROGRESS_BLOCKS == 0)
++			printf("nandsync: at 0x%llx, %llu blocks, %llu %s\n",
++			       off + mtd->erasesize, blocks, differ,
++			       check ? "differ" : "rewritten");
++	}
++	printf("nandsync: %llu blocks, %llu %s\n", blocks, differ,
++	       check ? "differ" : "rewritten and read back");
++	free(buf);
++	put_mtd_device(mtd);
++	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(nandsync, 5, 0, do_nandsync,
++	   "make an MTD region hold what RAM holds, block by block",
++	   "<mtd> <addr> <offset> <length>\n"
++	   "    - read each eraseblock; erase, write and read back only one\n"
++	   "      that differs from RAM at <addr> (or cannot be read)\n"
++	   "nandsync.check <mtd> <addr> <offset> <length>\n"
++	   "    - only count the blocks that differ");

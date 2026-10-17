@@ -6,6 +6,7 @@ The unit is always in one of these states, named by the prompt it shows:
     stock    vendor U-Boot (`ECNT>`), the first stage; stopped by the boot catcher
     loader   our U-Boot (`SDR loader>`), loaded by stock from NAND or over TFTP
     dumper   the write-free dumper (`dumper>`), loaded by stock over TFTP
+    restorer the restorer (`restore>`), loaded by stock over TFTP
     linux    our Linux root shell
 
 Every path to another state goes through stock: a reset or reboot comes back to
@@ -14,7 +15,7 @@ stock's countdown, which the catcher stops.
 import re
 import secrets
 
-STATES = ('stock', 'loader', 'dumper', 'linux')
+STATES = ('stock', 'loader', 'dumper', 'restorer', 'linux')
 COUNTDOWN = re.compile(r'(?i)key to (?:stop|abort|interrupt)')
 # U-Boot and shell output that means the command did not do what was asked,
 # even when the shell reports success.
@@ -65,8 +66,8 @@ def verify_fit(console, address, algorithm='sha1'):
 
 
 def identify(console, log, settle=12.0):
-    """Name the console state, transmitting nothing but one newline."""
-    console.send_async('')
+    """Name the console state, transmitting nothing but one Ctrl-C."""
+    console.wake()
     start = console.mark()
     console.wait(lambda: any(console.at_prompt(name) for name in STATES), settle,
                  'a known prompt')
@@ -87,11 +88,13 @@ def wait_for_power_on(console, minutes=POWER_ON_MINUTES):
     console.expect_prompt('stock', timeout=15)
 
 
-def to_stock(console, log, state):
-    """Reach the stock prompt from any state."""
-    if state == 'stock':
+def to_stock(console, log, state, fresh=False):
+    """Reach the stock prompt from any state. With `fresh`, stock's own boot is
+    always seen in this run (a unit already at its prompt is reset), for what it
+    prints about the NAND (`bmt pool size: N`)."""
+    if state == 'stock' and not fresh:
         return
-    if state in ('linux', 'loader', 'dumper'):
+    if state in STATES:
         console.arm()
         # `reboot -f` so a wedged userspace cannot stop it.
         console.send_async('reboot -f' if state == 'linux' else 'reset')

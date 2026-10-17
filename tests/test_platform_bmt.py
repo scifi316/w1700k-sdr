@@ -39,7 +39,17 @@ POOL = model.clamped_pool(TOTAL)
 FACTORY = [5, 11, 20, 40, 100]
 REMAP = [(7, SYSTEM + 3), (41, SYSTEM + 4)]
 ERRORS = {'SHORT': -1, 'SIGNATURE': -2, 'VERSION': -3, 'SIZE': -4, 'CHECKSUM': -5,
-          'UNPINNABLE': -6, 'RANGE': -7, 'ORDER': -8, 'NOTLOADED': -9}
+          'UNPINNABLE': -6, 'RANGE': -7, 'ORDER': -8, 'NOTLOADED': -9, 'POOL': -10,
+          'MARKER': -11}
+# The W25N04LV: 2048 blocks, a pool the scan decides. Two factory-bad blocks in
+# the scanned span make it 165 (platform/bmt/tests/geometry.h uses the same).
+LV_TOTAL = 2048
+LV_TOP_BAD = {LV_TOTAL - 41, LV_TOTAL - 42}
+# Every C harness runs once per part.
+GEOMETRIES = {'W25N04KV': [], 'W25N04LV': ['-DTEST_W25N04LV']}
+# The table-level harnesses also run the W25N04LV at the clamp (pool 250).
+TABLE_GEOMETRIES = {**GEOMETRIES, 'W25N04LV-pool-250': ['-DTEST_W25N04LV', '-DT_POOL=250u']}
+FactoryBad = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
 
 
 def has_header(header):
@@ -55,6 +65,7 @@ LIBCRYPTO = has_header('openssl/sha.h')
 
 class Table(ctypes.Structure):
     _fields_ = [('total_blocks', ctypes.c_uint16), ('system_blocks', ctypes.c_uint16),
+                ('page_bytes', ctypes.c_uint16), ('oob_bytes', ctypes.c_uint16),
                 ('geometry_set', ctypes.c_uint8), ('bbt_loaded', ctypes.c_uint8),
                 ('bmt_loaded', ctypes.c_uint8), ('bbt_ascending', ctypes.c_uint8),
                 ('bbt_size', ctypes.c_uint16), ('bmt_size', ctypes.c_uint16),
@@ -78,7 +89,11 @@ class Translation(unittest.TestCase):
                      'airoha_bmt_clamped_pool'):
             getattr(lib, name).restype = ctypes.c_uint32
             getattr(lib, name).argtypes = [ctypes.c_uint32]
-        lib.airoha_bmt_set_geometry.argtypes = [ctypes.POINTER(Table), ctypes.c_uint32]
+        lib.airoha_bmt_set_geometry.argtypes = [ctypes.POINTER(Table), ctypes.c_uint32,
+                                                ctypes.c_uint32]
+        lib.airoha_bmt_set_pages.argtypes = [ctypes.POINTER(Table), ctypes.c_uint32,
+                                             ctypes.c_uint32]
+        lib.airoha_bmt_vendor_pool.argtypes = [ctypes.c_uint32, FactoryBad, ctypes.c_void_p]
         for name in ('airoha_bmt_parse_bbt', 'airoha_bmt_parse_bmt'):
             getattr(lib, name).argtypes = [ctypes.POINTER(Table), ctypes.c_char_p,
                                            ctypes.c_uint32]
@@ -95,7 +110,7 @@ class Translation(unittest.TestCase):
         table = Table()
         bbt = model.bbt(FACTORY) if bbt is None else bbt
         bmt = model.bmt(REMAP) if bmt is None else bmt
-        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL), 0)
+        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL), 0)
         self.assertEqual(self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), bbt, len(bbt)), 0)
         self.assertEqual(self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), bmt, len(bmt)), 0)
         return table
@@ -107,12 +122,95 @@ class Translation(unittest.TestCase):
         self.assertEqual(self.lib.airoha_bmt_pool_floor(TOTAL), TOTAL * 8 // 100)
         self.assertEqual(self.lib.airoha_bmt_pool_ceiling(TOTAL), TOTAL // 8)
         self.assertEqual(self.lib.airoha_bmt_clamped_pool(TOTAL), model.MAX_ENTRIES)
-        small = TOTAL // 2
-        self.assertIsNone(model.clamped_pool(small))
-        self.assertEqual(self.lib.airoha_bmt_clamped_pool(small), 0)
+        self.assertIsNone(model.clamped_pool(LV_TOTAL))
+        self.assertEqual(self.lib.airoha_bmt_clamped_pool(LV_TOTAL), 0)
+
+    def scan(self, total, bad, unreadable=(), flaky=()):
+        reads = []
+
+        def factory_bad(_ctx, block):
+            reads.append(block)
+            if block in flaky:              # set on the first read only
+                return int(reads.count(block) == 1)
+            return -5 if block in unreadable else int(block in bad)
+        callback = FactoryBad(factory_bad)
+        return self.lib.airoha_bmt_vendor_pool(total, callback, None), reads
+
+    def test_the_pool_is_the_vendor_scan(self):
+        # The W25N04KV: the clamp fixes 250 and nothing is read.
+        self.assertEqual(self.scan(TOTAL, set(range(3800, 4096))), (250, []))
+        # The W25N04LV: 163, plus every factory-bad block in the span, up to the
+        # clamp; past the ceiling (256) there is no BMT.
+        top = LV_TOTAL - 1
+        cases = [set(), LV_TOP_BAD, {5, 100, 1700}, set(range(top - 86, top + 1)),
+                 set(range(top - 87, top + 1)), set(range(top - 92, top + 1)),
+                 set(range(top - 93, top + 1)), {top, top - 162}]
+        for bad in cases:
+            with self.subTest(bad=len(bad)):
+                expected = model.vendor_pool(LV_TOTAL, bad)
+                pool, reads = self.scan(LV_TOTAL, bad)
+                self.assertEqual(pool, ERRORS['POOL'] if expected is None else expected)
+                self.assertEqual(reads[0], top)
+                self.assertEqual(reads, sorted(reads, reverse=True))
+        self.assertEqual(self.scan(LV_TOTAL, set())[0], 163)
+        self.assertEqual(self.scan(LV_TOTAL, LV_TOP_BAD)[0], 165)
+        self.assertEqual(self.scan(LV_TOTAL, set(range(top - 87, top + 1)))[0], 250)
+        self.assertEqual(self.scan(LV_TOTAL, set(range(top - 93, top + 1)))[0], ERRORS['POOL'])
+        # An unreadable marker inside the span is refused, never guessed; a set
+        # marker is read twice, and two reads that disagree are refused too.
+        self.assertEqual(self.scan(LV_TOTAL, set(), unreadable={top - 3})[0], ERRORS['MARKER'])
+        self.assertEqual(self.scan(LV_TOTAL, set(), flaky={top - 3})[0], ERRORS['MARKER'])
+        reads = self.scan(LV_TOTAL, LV_TOP_BAD)[1]
+        self.assertEqual([reads.count(block) for block in sorted(LV_TOP_BAD)], [2, 2])
+        self.assertEqual(self.scan(LV_TOTAL, set(), unreadable={top - 300})[0], 163)
+
+    def test_page_geometry_is_one_of_the_two_parts(self):
+        lib = self.lib
         table = Table()
-        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), small),
-                         ERRORS['UNPINNABLE'])
+        self.assertEqual(lib.airoha_bmt_set_pages(ctypes.byref(table), 2048, 56),
+                         ERRORS['RANGE'])           # before the geometry
+        lib.airoha_bmt_set_geometry(ctypes.byref(table), LV_TOTAL, 165)
+        for page, oob, expected in [(2048, 56, 0), (4096, 112, 0), (1024, 28, 'RANGE'),
+                                    (8192, 112, 'RANGE'), (4096, 113, 'RANGE'),
+                                    (4096, 3, 'RANGE')]:
+            with self.subTest(page=page, oob=oob):
+                self.assertEqual(lib.airoha_bmt_set_pages(ctypes.byref(table), page, oob),
+                                 ERRORS.get(expected, 0))
+
+    def test_only_a_pool_the_vendor_rule_can_return_is_accepted(self):
+        for total, pool, expected in [(TOTAL, 250, 0), (TOTAL, 249, 'UNPINNABLE'),
+                                      (TOTAL, 251, 'UNPINNABLE'), (LV_TOTAL, 163, 0),
+                                      (LV_TOTAL, 162, 'UNPINNABLE'), (LV_TOTAL, 250, 0),
+                                      (LV_TOTAL, 251, 'UNPINNABLE'), (100, 8, 0),
+                                      (64, 4, 'UNPINNABLE')]:
+            with self.subTest(total=total, pool=pool):
+                table = Table()
+                status = self.lib.airoha_bmt_set_geometry(ctypes.byref(table), total, pool)
+                self.assertEqual(status, ERRORS.get(expected, 0))
+                if not status:
+                    self.assertEqual(table.system_blocks, total - pool)
+
+    def test_a_w25n04lv_translates_like_the_model(self):
+        pool = model.vendor_pool(LV_TOTAL, LV_TOP_BAD)
+        system = LV_TOTAL - pool
+        remap = [(7, system + 3), (41, system + 4), (1700, LV_TOTAL - 2)]
+        table = Table()
+        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), LV_TOTAL,
+                                                          pool), 0)
+        first, second = model.bbt(FACTORY), model.bmt(remap, pool_blocks=pool)
+        self.assertEqual(self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), first,
+                                                       len(first)), 0)
+        self.assertEqual(self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), second,
+                                                       len(second)), 0)
+        bbt, bmt = model.parse_bbt(first), model.parse_bmt(second, pool)
+        shifts = model.shift_map(bbt['entries'], system)
+        for logical in range(LV_TOTAL):
+            self.assertEqual(self.lib.airoha_bmt_translate(ctypes.byref(table), logical),
+                             model.translate(logical, bbt, bmt, system, shifts), logical)
+        # The checksum covers the pool's 165 entries: a 250-entry sum is refused.
+        wrong = model.bmt(remap, pool_blocks=model.MAX_ENTRIES)
+        status = self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), wrong, len(wrong))
+        self.assertEqual(status, ERRORS['CHECKSUM'])
 
     def test_every_block_translates_like_the_model(self):
         table = self.loaded()
@@ -149,7 +247,7 @@ class Translation(unittest.TestCase):
 
     def test_invalid_tables_are_refused_never_repaired(self):
         table = Table()
-        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL)
+        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL)
         broken = bytearray(model.bmt(REMAP))
         broken[model.BMT_HEADER + 4 * (POOL - 1)] ^= 1
         cases = {
@@ -173,7 +271,7 @@ class Translation(unittest.TestCase):
 
     def test_a_descending_bbt_refuses_translation(self):
         table = Table()
-        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL)
+        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL)
         descending = model.bbt(list(reversed(FACTORY)))
         self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), descending, len(descending))
         bmt = model.bmt(REMAP)
@@ -189,7 +287,7 @@ class Translation(unittest.TestCase):
                 ([], [(64, TOTAL)], 'RANGE'), ([], [(TOTAL, SYSTEM)], 'RANGE'),
                 ([], [(TOTAL - 1, SYSTEM)], 0)]:
             table = Table()
-            self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL)
+            self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL)
             first, second = model.bbt(bbt), model.bmt(bmt)
             status = self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), first, len(first)) or \
                 self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), second, len(second))
@@ -216,15 +314,17 @@ class TableWriting(unittest.TestCase):
 
     def test_harnesses_pass(self):
         with tempfile.TemporaryDirectory() as work:
-            for name in ('write_contract', 'publication', 'remap'):
-                with self.subTest(name):
-                    result = compile_and_run(
-                        [CC, '-DAIROHA_BMT_HOST', '-std=c11', '-O1', '-g', '-Wall', '-Wextra',
-                         '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all',
-                         f'-I{BMT}', BMT / f'tests/{name}.c', BMT / 'airoha_bmt.c',
-                         BMT / 'airoha_bmt_write.c', BMT / 'airoha_bmt_transaction.c',
-                         '-lcrypto'], Path(work) / name)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for part, flags in TABLE_GEOMETRIES.items():
+                for name in ('write_contract', 'publication', 'remap'):
+                    with self.subTest(name, part=part):
+                        result = compile_and_run(
+                            [CC, '-DAIROHA_BMT_HOST', *flags, '-std=c11', '-O1', '-g', '-Wall',
+                             '-Wextra', '-Werror', '-fsanitize=undefined',
+                             '-fno-sanitize-recover=all', f'-I{BMT}', BMT / f'tests/{name}.c',
+                             BMT / 'airoha_bmt.c', BMT / 'airoha_bmt_write.c',
+                             BMT / 'airoha_bmt_transaction.c', '-lcrypto'],
+                            Path(work) / f'{name}-{part}', timeout=600)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 def function(source, signature):
@@ -290,18 +390,21 @@ class Bindings(unittest.TestCase):
 
     def check_binding(self, name, layer, tree, write_config):
         linux = name == 'linux'
-        result = compile_and_run(self.command(layer, linux) +
-                                 [BMT / 'tests/bindings.c', BMT / 'airoha_bmt.c'],
-                                 self.out / name, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         include = self.ubi_consumer(name, tree)
-        result = compile_and_run(
-            self.command(layer, linux) +
-            [f'-D{write_config}=1', '-DAIROHA_BMT_HOST', f'-DUBI_CONSUMER_FILE="{include}"',
-             BMT / 'tests/managed_bindings.c', BMT / 'airoha_bmt.c',
-             BMT / 'airoha_bmt_write.c', BMT / 'airoha_bmt_transaction.c', '-lcrypto',
-             '-pthread'], self.out / f'managed-{name}', timeout=60)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for part, flags in GEOMETRIES.items():
+            with self.subTest(part):
+                result = compile_and_run(self.command(layer, linux) + flags +
+                                         [BMT / 'tests/bindings.c', BMT / 'airoha_bmt.c'],
+                                         self.out / f'{name}-{part}', timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                result = compile_and_run(
+                    self.command(layer, linux) + flags +
+                    [f'-D{write_config}=1', '-DAIROHA_BMT_HOST',
+                     f'-DUBI_CONSUMER_FILE="{include}"', BMT / 'tests/managed_bindings.c',
+                     BMT / 'airoha_bmt.c', BMT / 'airoha_bmt_write.c',
+                     BMT / 'airoha_bmt_transaction.c', '-lcrypto', '-pthread'],
+                    self.out / f'managed-{name}-{part}', timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_uboot_binding(self):
         self.check_binding('uboot', ROOT / 'platform/loader/airoha_bmt_layer.c', UBOOT_SRC,

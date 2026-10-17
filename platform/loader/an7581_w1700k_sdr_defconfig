@@ -43,7 +43,9 @@ CONFIG_CMD_SAVEENV=y
 CONFIG_CMD_PING=y
 CONFIG_CMD_TFTPBOOT=y
 CONFIG_CMD_TFTPPUT=y
-CONFIG_TFTP_WINDOWSIZE=8
+# One block per acknowledgement: at line rate a window of 8 overruns the
+# driver's eight receive buffers (window 1: about 20 MiB/s).
+CONFIG_TFTP_WINDOWSIZE=1
 CONFIG_CMD_HASH=y
 CONFIG_HASH=y
 CONFIG_OF_UPSTREAM=y

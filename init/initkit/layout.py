@@ -16,8 +16,9 @@ LOADER_OFFSET, LOADER_SLOT = partitions.GEOMETRY['loader']
 
 
 def loader_extent(size):
-    """The loader FIT's length rounded up to whole erase blocks."""
-    extent = -(-size // partitions.BLOCK_BYTES) * partitions.BLOCK_BYTES
+    """The loader FIT's length rounded up to whole erase blocks of every part
+    (256 KiB), so one extent serves the W25N04KV and the W25N04LV."""
+    extent = -(-size // partitions.ALIGNMENT) * partitions.ALIGNMENT
     if extent > LOADER_SLOT:
         raise ValueError(f'the loader ({size} bytes) does not fit its {LOADER_SLOT}-byte slot')
     return extent
@@ -71,12 +72,11 @@ def erase(partition):
             for offset in range(0, length, ERASE_STEP)]
 
 
-def create_system_volumes():
-    """The `system` UBI volumes, in id order."""
+def create_system_volumes(nand):
+    """The `system` UBI volumes of `nand`, in id order."""
     commands = []
-    for volume_id, (name, kind, lebs) in enumerate(partitions.SYSTEM_VOLUMES):
-        size = partitions.ENV_BYTES if name.startswith('ubootenv') else \
-            lebs * partitions.LEB_BYTES
+    for volume_id, (name, kind, lebs) in enumerate(partitions.system_volumes(nand)):
+        size = partitions.ENV_BYTES if name.startswith('ubootenv') else lebs * nand.leb
         commands.append(f"ubi create {name} {size:#x} {'s' if kind == 'static' else 'd'} "
                         f'{volume_id}')
     return commands

@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: MIT
 """A TFTP server for the installer: unprivileged, one directory, one peer at a time.
 
-It serves the images U-Boot fetches and receives the NAND backup U-Boot sends.
+It serves the images U-Boot fetches and receives the backups and raw dumps U-Boot
+sends.
 
 * An upload never overwrites a file: a write request for an existing name is
   refused with TFTP error 6.
 * It binds one specific local address, never a wildcard.
-* Block numbers are 16 bits and wrap several times during the 544 MiB backup.
+* Block numbers are 16 bits and wrap several times during the 446 MiB backup.
   U-Boot wraps 65535 -> 0 -> 1 and carries the wrap in its file offset, so this
   server addresses the file by a monotonic block index, not the wire number.
 

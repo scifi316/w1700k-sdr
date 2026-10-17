@@ -190,9 +190,9 @@ class WireNumbering(unittest.TestCase):
             self.assertEqual(uboot, index * blksize,
                              f'index {index} disagrees with the U-Boot formula')
 
-    def test_the_544_mib_dump_wraps_the_counter(self):
-        dump = 0x22000000                      # the dumper's whole-chip length
-        for blksize, wraps in ((1468, 5), (512, 17)):
+    def test_the_446_mib_dump_wraps_the_counter(self):
+        dump = 0x1be00000                      # the dumper's backup length
+        for blksize, wraps in ((1468, 4), (512, 13)):
             blocks = -(-dump // blksize)
             self.assertEqual(blocks // tftpd.SEQUENCE, wraps)
             # A receiver ignoring the wrap would stop being correct here.
@@ -280,22 +280,22 @@ class Serving(unittest.TestCase):
         with Server(self.root) as server:
             client = Client(server.port)
             self.addCleanup(client.close)
-            error = client.put_file('unit001-nand-raw.bin', payload, blksize=1468)
+            error = client.put_file('unit001-nand.bin', payload, blksize=1468)
             log = server.log
         self.assertIsNone(error)
-        written = (self.root / 'unit001-nand-raw.bin').read_bytes()
+        written = (self.root / 'unit001-nand.bin').read_bytes()
         self.assertEqual(written, payload)
         self.assertTrue(any(hashlib.sha256(payload).hexdigest() in line for line in log),
                         f'the received hash was not reported: {log}')
 
     def test_put_refuses_to_overwrite_an_existing_file(self):
-        (self.root / 'unit001-nand-raw.bin').write_bytes(b'original backup')
+        (self.root / 'unit001-nand.bin').write_bytes(b'original backup')
         with Server(self.root) as server:
             client = Client(server.port)
             self.addCleanup(client.close)
-            error = client.put_file('unit001-nand-raw.bin', os.urandom(600))
+            error = client.put_file('unit001-nand.bin', os.urandom(600))
         self.assertEqual(error, tftpd.E_EXISTS)
-        self.assertEqual((self.root / 'unit001-nand-raw.bin').read_bytes(),
+        self.assertEqual((self.root / 'unit001-nand.bin').read_bytes(),
                          b'original backup')
 
     def test_put_is_refused_when_the_server_is_read_only(self):
@@ -331,7 +331,7 @@ class Serving(unittest.TestCase):
         self.assertEqual(error, tftpd.E_NOTFOUND)
 
     def test_upload_crossing_a_block_wrap_is_byte_exact(self):
-        # The real 544 MiB dump wraps the 16-bit counter five times. Shrink the
+        # The real 446 MiB dump wraps the 16-bit counter four times. Shrink the
         # modulus instead of the transfer so the wrap path runs for real.
         sequence, blksize = 8, 16
         payload = os.urandom(blksize * (sequence * 3 + 2) + 5)

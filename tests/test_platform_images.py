@@ -167,11 +167,16 @@ class BuiltImages(unittest.TestCase):
         self.assertEqual(fdt.string(tree['/images/dumper']['compression']), 'gzip')
         self.assertLessEqual(-(-len(data) // 32768), 6)
 
-    @built('durable.ubifs')
-    def test_the_durable_image_is_normalised(self):
-        data = (IMAGES / 'durable.ubifs').read_bytes()
-        self.assertEqual(images.normalize_ubifs(data), data)
-        self.assertLessEqual(len(data), partitions.DURABLE_LEBS * partitions.LEB_BYTES)
+    @built(*(images.durable_image(nand).name for nand in partitions.NANDS))
+    def test_each_part_has_a_normalised_durable_image(self):
+        for nand in partitions.NANDS:
+            with self.subTest(nand.name):
+                data = images.durable_image(nand).read_bytes()
+                self.assertEqual(images.normalize_ubifs(data), data)
+                self.assertLessEqual(len(data), partitions.durable_lebs(nand) * nand.leb)
+                # The superblock records the part's minimum I/O and LEB sizes.
+                sb = data[:4096]
+                self.assertEqual(struct.unpack_from('<II', sb, 0x20), (nand.page, nand.leb))
 
 
 if __name__ == '__main__':

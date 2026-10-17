@@ -1,0 +1,46 @@
+SPDX-License-Identifier: GPL-2.0+
+Subject: [PATCH] cmd: mtd: report the BMT translation, and read through corrected pages
+
+`mtd list` names the view of the chip (vendor BBT/BMT or none), so the
+installer backs up only translated data. A read stops only at a page the ECC
+could not correct: -EUCLEAN means the ECC corrected it and its data is good,
+which aborted the whole read before.
+
+--- a/cmd/mtd.c
++++ b/cmd/mtd.c
+@@ -25,6 +25,11 @@
+ 
+ #include <linux/ctype.h>
+ 
++#if IS_ENABLED(CONFIG_AIROHA_BMT)
++/* platform/loader/airoha_bmt_layer.c */
++int airoha_bmt_attached(const struct mtd_info *mtd);
++#endif
++
+ static struct mtd_info *get_mtd_by_name(const char *name)
+ {
+ 	struct mtd_info *mtd;
+@@ -170,6 +175,10 @@
+ 
+ 	printf("  - flags: 0x%x (%s)\n", mtd->flags,
+ 	       (mtd->flags & MTD_WRITEABLE) ? "writeable" : "read-only");
++#if IS_ENABLED(CONFIG_AIROHA_BMT)
++	printf("  - translation: %s\n", airoha_bmt_attached(mtd) ?
++	       "vendor BBT/BMT" : "none");
++#endif
+ 
+ 	printf("  - block size: 0x%x bytes\n", mtd->erasesize);
+ 	printf("  - min I/O: 0x%x bytes\n", mtd->writesize);
+@@ -600,6 +609,12 @@
+ 			ret = mtd_special_write_oob(mtd, off, &io_op,
+ 						    write_empty_pages, woob);
+ 
++		/* The ECC corrected the page: its data is good, however many
++		 * bits it took. Only an uncorrectable page fails a read. */
++		if (read && mtd_is_bitflip(ret)) {
++			printf("Corrected bitflips at offset 0x%llx\n", off);
++			ret = 0;
++		}
+ 		if (ret) {
+ 			printf("Failure while %s at offset 0x%llx\n",
+ 			       read ? "reading" : "writing", off);

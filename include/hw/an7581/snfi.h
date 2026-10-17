@@ -242,12 +242,18 @@
  * 0xff. A table occupies page 0 of its block.
  *
  * Pool sizing (total = blocks on the part) [static]:
- *   scan downward until total*8/100 good blocks are counted; pool = total -
- *   that cursor (>= total*8/100, growing with bad blocks in the span);
+ *   scan downward until total*8/100 good blocks are counted, a good block
+ *   being one whose OOB byte 0 (the factory marker) reads 0xff; byte 1 (worn)
+ *   is not looked at, and a failed marker read is not checked (U-Boot
+ *   0x81e1b540, is_bad(block, 0) at 0x81e1b49c); pool = total - that cursor
+ *   (>= total*8/100, growing with factory-bad blocks in the span);
  *   pool > total/8 fails BMT init ("bmt pool size > maximum");
  *   otherwise pool is clamped to 250, the table capacity, and
  *   system_blocks = total - pool.
  *   For any part of >= 3138 blocks the clamp always fires, so pool = 250.
+ *   On a 2048-block part (W25N04LV) it does not: pool = 163 + the factory-bad
+ *   blocks in the span, per unit, and the BMT checksum covers that many
+ *   entries.
  *   The usable size published to Linux by the stock kernel is fixed at
  *   (total - total/8) blocks, independent of the measured pool.
  *
@@ -289,8 +295,9 @@
 #define AN7581_BMT_VERSION_VAL          1u
 #define AN7581_BMT_UNUSED               0x4u    /* u8, left 0xff */
 #define AN7581_BMT_SIZE                 0x5u    /* u8, entry count */
-/* (version + size + sum of the 1000 entry bytes) & 0xff. The extent is the
- * runtime pool (always 250 entries = 1000 bytes after the clamp), not SIZE. */
+/* (version + size + sum of the pool's entry bytes) & 0xff. The extent is the
+ * runtime pool, not SIZE: 250 entries = 1000 bytes on the W25N04KV (clamped),
+ * the scanned pool on the W25N04LV. Unused entries are zero. */
 #define AN7581_BMT_CHECKSUM             0x6u
 #define AN7581_BMT_ENTRIES              0x14u   /* {u16 from; u16 to}[250], LE */
 #define AN7581_BMT_ENTRY_BYTES          4u

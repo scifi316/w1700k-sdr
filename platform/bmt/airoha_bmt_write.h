@@ -6,9 +6,9 @@
 
 #include "airoha_bmt.h"
 
-#define AIROHA_WRITE_PAGE 2048u
-#define AIROHA_WRITE_BLOCK 131072u
-#define AIROHA_WRITE_OOB 56u
+/* Pages, blocks and free OOB come from the map (airoha_bmt_set_pages): 2048 +
+ * 56 per page and 128 KiB blocks on the W25N04KV, 4096 + 112 and 256 KiB on
+ * the W25N04LV. Page buffers are AIROHA_BMT_PAGE_MAX bytes. */
 #define AIROHA_INTENT_BYTES 240u
 #define AIROHA_RETIRE_ATTEMPTS 3u
 
@@ -45,8 +45,9 @@ struct airoha_bmt_intent {
 	/* Reserve-index bitmap captured after a full erased-state inventory.
 	 * It identifies blocks this one serialized transaction may have dirtied
 	 * during interrupted metadata retries. Existing data/tables have zero
-	 * bits; candidate and journal were free and have one bits. Bits 250..255
-	 * are zero. It does not authorize ordinary master writes to the pool. */
+	 * bits; candidate and journal were free and have one bits. Bits from the
+	 * pool size to 255 are zero. It does not authorize ordinary master writes
+	 * to the pool. */
 	airoha_u8 free_pool[32];
 	/* Complete canonical preimage for PROGRAM. Allows safe abort when reset
 	 * interrupts the stage before original I/O; ERASE does not need old data. */
@@ -61,8 +62,9 @@ int airoha_bmt_write_validate(const struct airoha_bmt *t,
 			    airoha_u32 bbt_block, airoha_u32 bmt_block);
 
 /* Canonical vendor-compatible bytes: version 1, FF reserved header, zero unused
- * entries as in the matched vendor's initial in-memory table. Caller supplies
- * a full page, which remains untouched when validation fails. */
+ * entries as in the matched vendor's initial in-memory table, the BMT checksum
+ * over the pool's entries. Caller supplies a full page (t->page_bytes), which
+ * remains untouched when validation fails. */
 int airoha_bmt_encode(const struct airoha_bmt *t, airoha_u8 *page, airoha_u32 len);
 int airoha_bbt_encode(const struct airoha_bmt *t, airoha_u8 *page, airoha_u32 len);
 
@@ -74,12 +76,16 @@ int airoha_bmt_replace(struct airoha_bmt *t, airoha_u32 logical,
 		       airoha_u32 candidate);
 
 /* The byte contract is explicit, never memcpy(struct) or native-endian fields.
- * decode validates hash, geometry, ranges, distinct metadata/data storage and
- * record padding before publishing any output fields. */
+ * The record carries the block, page, free-OOB and chip geometry of `t`, the
+ * map it was written against; decode validates hash, that geometry, ranges,
+ * distinct metadata/data storage and record padding before publishing any
+ * output fields. */
 int airoha_bmt_intent_encode(const struct airoha_bmt_intent *intent,
-		airoha_u8 *page, airoha_u32 len, airoha_sha256_fn hash);
+		const struct airoha_bmt *t, airoha_u8 *page, airoha_u32 len,
+		airoha_sha256_fn hash);
 int airoha_bmt_intent_decode(struct airoha_bmt_intent *intent,
-		const airoha_u8 *page, airoha_u32 len, airoha_sha256_fn hash);
+		const struct airoha_bmt *t, const airoha_u8 *page, airoha_u32 len,
+		airoha_sha256_fn hash);
 
 /* Check a recovered journal against the loaded tables. Accept only the exact
  * old mapping or the exact one-entry committed replacement derived from it.

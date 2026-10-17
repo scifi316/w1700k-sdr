@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from initkit import config, install, session          # noqa: E402
+from initkit import config, install, nand, session    # noqa: E402
 from initkit.console import StepFailed                # noqa: E402
 from initkit.provision import ProvisionError          # noqa: E402
 
@@ -33,11 +33,14 @@ def main():
                         help='stop after the backup; nothing is written to the unit')
     parser.add_argument('--force', action='store_true',
                         help='install even though stock already boots our loader')
+    parser.add_argument(nand.UNTESTED_FLAG, dest='accept_untested', action='store_true',
+                        help='install on a NAND part this project has never run on a unit '
+                             '(the W25N04LV), at the risk of corrupting it')
     args = parser.parse_args()
     try:
         return install.run(session.settings_from(args), args.expect_serial,
                            args.authorized_key, args.import_host_key, args.force,
-                           args.backup_only)
+                           args.backup_only, args.accept_untested)
     except (StepFailed, ProvisionError, RuntimeError) as error:
         sys.exit(f'install: {error}')
     except KeyboardInterrupt:
