@@ -84,7 +84,9 @@ class Fits(unittest.TestCase):
         payload = loader.compress(image)
         self.assertEqual(struct.unpack_from('<I', payload, 1)[0], 0x800000)
         self.assertEqual(struct.unpack_from('<Q', payload, 5)[0], len(image))
-        self.assertEqual(lzma.decompress(payload, format=lzma.FORMAT_ALONE), image)
+        # Decoded as 'size unknown': liblzma 5.2.5 rejects a known size followed by the end marker.
+        stream = payload[:5] + b'\xff' * 8 + payload[13:]
+        self.assertEqual(lzma.decompress(stream, format=lzma.FORMAT_ALONE), image)
 
 
 class Durable(unittest.TestCase):
